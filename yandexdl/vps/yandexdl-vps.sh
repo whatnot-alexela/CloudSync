@@ -7,6 +7,7 @@
 #   bash yandexdl-vps.sh vnc-off            выключить noVNC (после входа в Яндекс)
 #   bash yandexdl-vps.sh fetch Творчество   обойти папку и скачать её (в /root/yandex/Диск/…);
 #        [--no-crawl] [--rclone gdrive:Папка] [--threads 1]   без обхода; частями в облако; потоки
+#   bash yandexdl-vps.sh pick Папка         оставить в папке только выбранные подпапки и обойти их
 #   bash yandexdl-vps.sh status             что сейчас происходит
 #   bash yandexdl-vps.sh diagnose           в каком виде Диск отдаёт списки папок (если файлов 0)
 #   bash yandexdl-vps.sh start|stop|restart|logs
@@ -259,6 +260,12 @@ cmd_status() {
   fi
 }
 
+cmd_pick() {
+  wait_api 5 || die "программа не запущена: yandexdl start"
+  systemctl is-active -q yandexdl-fetch && die "сначала останови загрузку: systemctl stop yandexdl-fetch"
+  "$VENV/bin/python" -u "$APP_DIR/vps/pick.py" "$@"
+}
+
 cmd_diagnose() { "$VENV/bin/python" -u "$APP_DIR/vps/diagnose.py" "$DUMP_DIR"; }
 
 cmd_logs() { journalctl -u yandexdl-app -o cat --no-pager -n "${1:-80}" | grep -v '"GET /api/' || true; }
@@ -272,7 +279,8 @@ case "${1:-}" in
   vnc-off)  cmd_vnc_off ;;
   fetch)    shift; cmd_fetch "$@" ;;
   status)   cmd_status ;;
+  pick)     shift; cmd_pick "$@" ;;
   diagnose) cmd_diagnose ;;
   logs)     shift; cmd_logs "$@" ;;
-  *) sed -n '2,12p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 1 ;;
+  *) sed -n '2,13p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac
