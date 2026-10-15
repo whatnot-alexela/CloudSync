@@ -41,6 +41,7 @@ import time
 import urllib.error
 import urllib.request
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import unquote, urlparse
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -219,6 +220,13 @@ FL_MAX_THREADS = 8
 FL_ATTEMPTS = 5             # попыток на файл: каждая со свежей ссылкой, докачка с места обрыва
 FL_READ_TIMEOUT = 30        # сек: на соединение и на каждый блок данных (общего лимита нет — файлы бывают большими)
 FL_CRAWL_AGENT_TIMEOUT = 6  # сек: окно приложения не спрашивало /api/fl/crawl дольше — считаем, что его нет
+# Спасение повреждённых файлов (после аварии на Диске сервер на битых местах отдаёт пустой ответ или зависает):
+FL_SALVAGE_BLOCK = 256 * 1024   # читаем кусками такого размера
+FL_SALVAGE_SUB = 32 * 1024      # проба начала куска и дочитывание у края дыры
+FL_SALVAGE_TIMEOUT = 15         # сек на кусок
+FL_SALVAGE_JOBS = 3             # кусков одновременно
+FL_SALVAGE_LINK_REFRESH = 5     # сколько раз за файл можно взять новую ссылку
+FL_SALVAGE_BUDGET = 600         # сек на файл сверх времени при 50 КБ/с; потом недочитанное считается потерянным
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 256 * 1024 * 1024
@@ -1381,6 +1389,10 @@ def short_err(e):
 
 class Aborted(Exception):
     """Загрузка остановлена пользователем."""
+
+
+class Unreadable(Exception):
+    """Файл на Диске не отдаёт ни одного байта — спасать нечего."""
 
 
 class DeadlineError(Exception):
@@ -2677,22 +2689,32 @@ class FileDownloader:
         final_path = os.path.join(files_dir(), *rel.split("/"))
         tmp = os.path.join(os.path.dirname(final_path),
                            f".{hashlib.md5(path.encode('utf-8')).hexdigest()[:8]}.part")
+        size = row.get("size")
         errors = []
         try:
             for attempt in range(1, FL_ATTEMPTS + 1):
                 if self.stop_event.is_set():
                     raise Aborted()
                 prog["attempt"] = attempt
+                note = None
                 try:
-                    nbytes = self._fetch(path, tmp, row.get("size"), prog)
+                    # Первая попытка — обычная загрузка. Оборвалась — файл, скорее всего, повреждён на стороне
+                    # Яндекса: дальше спасаем его по кускам (размер нужен, чтобы знать, где куски).
+                    if attempt == 1 or not size:
+                        nbytes = self._fetch(path, tmp, size, prog)
+                    else:
+                        nbytes, note = self._salvage(path, tmp, size, prog)
                     os.replace(tmp, final_path)
                     verify_saved_file(files_dir(), rel, expected_size=nbytes, min_size=0)
                 except (Aborted, AuthError):
                     raise
+                except Unreadable as e:
+                    errors.append(f"{attempt}: {e}")
+                    break
                 except Exception as e:  # noqa: BLE001
                     # свои ошибки (VideoError, голый OSError) показываем как есть, без имени класса
                     errors.append(f"{attempt}: {e if isinstance(e, VideoError) or type(e) is OSError else short_err(e)}")
-                    if attempt < FL_ATTEMPTS:
+                    if attempt < FL_ATTEMPTS and not size:
                         self._wait(min(30, 3 * attempt))
                     continue
                 mtime = _as_int(row.get("mtime"))
@@ -2701,7 +2723,7 @@ class FileDownloader:
                         os.utime(final_path, (mtime, mtime))   # дата изменения как на Диске
                     except (OSError, OverflowError, ValueError):
                         pass
-                self._set_file(path, "done", file=rel, nbytes=nbytes)
+                self._set_file(path, "done", file=rel, nbytes=nbytes, note=note)
                 self._on_result(True, nbytes)
                 return
             self._record_fail(path, "; ".join(errors))
@@ -2768,6 +2790,163 @@ class FileDownloader:
         if total is not None and got != total:
             raise IOError(f"неполный файл {got}/{total}")
         return got
+
+    def _salvage(self, path, tmp, size, prog):
+        """
+        Обычная загрузка оборвалась — файл, похоже, повреждён на стороне Яндекса: на битых местах сервер отдаёт
+        пустой ответ или зависает. Читаем его кусками через Range: что читается — сохраняем, нечитаемые куски
+        остаются нулями, смещения не сдвигаются (mp3/wav после этого обычно играются с паузами на месте дыр).
+        Начало, которое успела скачать обычная загрузка, берётся из tmp. Возвращает (size, заметка о потерях
+        или None, если файл в итоге прочитался целиком). Ни одного байта — Unreadable.
+        """
+        os.makedirs(os.path.dirname(tmp), exist_ok=True)
+        have = min(os.path.getsize(tmp), size) if os.path.exists(tmp) else 0
+        with open(tmp, "ab"):
+            pass
+        with open(tmp, "r+b") as f:
+            f.truncate(size)
+        ok = [[0, have]] if have else []
+        link = {"url": get_download_url(path), "refresh": 0, "dead": False, "http": None}
+        llock = threading.Lock()
+        deadline = time.monotonic() + FL_SALVAGE_BUDGET + size / 50000
+        prog.update(bytes=have, total=size, note="файл повреждён — спасаю по кускам")
+
+        def fresh_url(old):
+            with llock:
+                if link["url"] == old and not link["dead"]:
+                    if link["refresh"] >= FL_SALVAGE_LINK_REFRESH:
+                        link["dead"] = True
+                    else:
+                        link["refresh"] += 1
+                        try:
+                            link["url"] = get_download_url(path)
+                        except VideoError:
+                            link["dead"] = True
+
+        def read(a, b):
+            """Байты [a, b), сколько прочиталось подряд с начала (b"" — ничего)."""
+            for _ in range(3):
+                if self.stop_event.is_set():
+                    raise Aborted()
+                if link["dead"] or time.monotonic() > deadline:
+                    return b""
+                url = link["url"]
+                req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "*/*",
+                                                           "Referer": API_BASE + "/", "Range": f"bytes={a}-{b - 1}"})
+                buf = bytearray()
+                stop_at = time.monotonic() + FL_SALVAGE_TIMEOUT + (b - a) / 50000
+                try:
+                    with self.opener.open(req, timeout=FL_SALVAGE_TIMEOUT) as resp:
+                        if resp.status != 206 and not (resp.status == 200 and a == 0 and b == size):
+                            return b""
+                        while len(buf) < b - a and time.monotonic() < stop_at:
+                            if self.stop_event.is_set():
+                                raise Aborted()
+                            chunk = resp.read(min(16384, b - a - len(buf)))
+                            if not chunk:
+                                break
+                            buf += chunk
+                            self.window.append((time.monotonic(), len(chunk)))
+                except urllib.error.HTTPError as e:
+                    link["http"] = e.code
+                    if e.code in (401, 403, 410):      # ссылка просрочена — берём новую
+                        fresh_url(url)
+                        continue
+                    return b""
+                except Aborted:
+                    raise
+                except Exception:  # noqa: BLE001 — таймаут/обрыв: что успело прийти, то и берём
+                    pass
+                return bytes(buf)
+            return b""
+
+        def block(a, b):
+            first = read(a, min(b, a + FL_SALVAGE_SUB))
+            if not first:
+                return [], [(a, b)]                     # начало куска не читается — весь кусок потерян
+            oks, bads, p = [(a, first)], [], a + len(first)
+            if p < min(b, a + FL_SALVAGE_SUB):
+                return oks, [(p, b)]
+            if p < b:
+                rest = read(p, b)
+                if rest:
+                    oks.append((p, rest))
+                    p += len(rest)
+            while p < b:                                # оборвалось внутри куска — дочитываем мелко у края дыры
+                q = min(b, p + FL_SALVAGE_SUB)
+                d = read(p, q)
+                if d:
+                    oks.append((p, d))
+                if len(d) < q - p:
+                    bads.append((p + len(d), q))
+                p = q
+            return oks, bads
+
+        todo = [(p, min(size, p + FL_SALVAGE_BLOCK)) for p in range(have, size, FL_SALVAGE_BLOCK)]
+        done_bytes = have
+        with open(tmp, "r+b") as f, ThreadPoolExecutor(FL_SALVAGE_JOBS) as ex:
+            futs = {ex.submit(block, a, b): (a, b) for a, b in todo}
+            try:
+                for fu in as_completed(futs):
+                    oks, _bads = fu.result()
+                    for off, data in oks:
+                        f.seek(off)
+                        f.write(data)
+                        ok.append([off, off + len(data)])
+                    a, b = futs[fu]
+                    done_bytes += b - a
+                    prog["bytes"] = done_bytes
+            except BaseException:
+                for fu in futs:
+                    fu.cancel()
+                raise
+
+        def merged():
+            out = []
+            for a, b in sorted(ok):
+                if out and a <= out[-1][1]:
+                    out[-1][1] = max(out[-1][1], b)
+                else:
+                    out.append([a, b])
+            return out
+
+        def holes_of(good):
+            out, p = [], 0
+            for a, b in good + [[size, size]]:
+                if a > p:
+                    out.append((p, a))
+                p = max(p, b)
+            return out
+
+        # Левый край дыры уже точный (кусок дочитывается до места обрыва), а правый — нет: кусок, начало которого
+        # не прочиталось, целиком записан в потери, хотя дыра могла кончиться внутри него. Идём от правого края
+        # дыры назад мелкими кусками, пока читается.
+        with open(tmp, "r+b") as f:
+            for a, b in holes_of(merged()):
+                q = b
+                while q > a:
+                    p = max(a, q - FL_SALVAGE_SUB)
+                    d = read(p, q)
+                    if d:
+                        f.seek(p)
+                        f.write(d)
+                        ok.append([p, p + len(d)])
+                    if len(d) < q - p:
+                        break
+                    q = p
+
+        good = merged()
+        got = sum(b - a for a, b in good)
+        if not got:
+            raise Unreadable("не читается: Яндекс не отдал ни одного байта"
+                             + (f" (HTTP {link['http']})" if link["http"] else ""))
+        if got >= size:
+            return size, None
+        holes = holes_of(good)
+        lost = size - got
+        note = (f"повреждён: потеряно {lost} из {size} байт ({100 * lost / size:.1f}%); дыры: "
+                + ", ".join(f"{a}-{b}" for a, b in holes[:8]) + (f" и ещё {len(holes) - 8}" if len(holes) > 8 else ""))
+        return size, note
 
     # ---------- статус для страницы
 
@@ -3046,6 +3225,17 @@ def api_fl_scope():
     if err:
         return jsonify(ok=False, error=err), 400
     return jsonify(ok=True, scope=folder)
+
+
+@app.get("/api/fl/damaged")
+def api_fl_damaged():
+    """Повреждённые (скачаны с дырами) и нечитаемые файлы в выбранной папке — для отчёта."""
+    with dbc() as c:
+        rows = c.execute(
+            "SELECT path, size, fl_status, fl_note, fl_error, fl_file FROM files WHERE kind='file' AND "
+            f"{FL.scope_sql()} AND ((fl_status='done' AND fl_note LIKE 'повреждён%') OR fl_status='failed') "
+            "ORDER BY path").fetchall()
+    return jsonify(items=[dict(r) for r in rows])
 
 
 @app.get("/api/fl/crawl")

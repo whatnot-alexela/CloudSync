@@ -4,7 +4,7 @@
 С --rclone скачанное частями переносится в облако, если всё сразу на сервер не помещается.
 
     python fetch.py --folder Творчество --dest /root/yandex [--dump-dir DIR] [--threads N]
-                    [--no-crawl] [--rclone gdrive:Яндекс [--reserve-gb 2] [--part-gb 5]]
+                    [--no-crawl] [--retry-failed] [--rclone gdrive:Яндекс [--reserve-gb 2] [--part-gb 5]]
     python fetch.py --status
 
 Только stdlib. Запускает yandexdl-vps.sh fetch / status.
@@ -224,7 +224,40 @@ class Mover:
             return None
 
 
-def report(st, mover=None):
+REPORT_NAME = "_повреждённые_файлы.txt"
+
+
+def damage_report(st):
+    """Список повреждённых (скачаны с дырами) и нечитаемых файлов — в файл рядом со скачанным
+    (уедет в облако вместе с ними). Возвращает (повреждённых, потеряно байт, нечитаемых)."""
+    items = api("/api/fl/damaged")["items"]
+    damaged = [x for x in items if x["fl_status"] == "done"]
+    failed = [x for x in items if x["fl_status"] == "failed"]
+    lost = 0
+    for x in damaged:
+        try:
+            lost += int(x["fl_note"].split("потеряно ", 1)[1].split(" ", 1)[0])
+        except (IndexError, ValueError):
+            pass
+    if not items:
+        return 0, 0, 0
+    folder = local_folder(st)
+    os.makedirs(folder, exist_ok=True)
+    root = st["scope"].rstrip("/") + "/"
+    with open(os.path.join(folder, REPORT_NAME), "w", encoding="utf-8") as f:
+        f.write(f"Папка на Диске: {st['scope']}\nСоставлено: {time.strftime('%Y-%m-%d %H:%M')}\n\n"
+                "Файлы, повреждённые на стороне Яндекс Диска. Скачано всё, что читалось; нечитаемые места\n"
+                "заполнены нулями, смещения внутри файла сохранены (аудио обычно играется с паузами на месте дыр).\n\n")
+        f.write(f"ПОВРЕЖДЕНЫ — {len(damaged)} файлов, потеряно {human(lost)}:\n")
+        for x in damaged:
+            f.write(f"  {x['path'][len(root):]}\n      {x['fl_note']}\n")
+        f.write(f"\nНЕ ЧИТАЮТСЯ (не скачаны) — {len(failed)} файлов:\n")
+        for x in failed:
+            f.write(f"  {x['path'][len(root):]}  ({human(x['size'])})\n      {(x['fl_error'] or '')[:300]}\n")
+    return len(damaged), lost, len(failed)
+
+
+def report(st, mover=None, dmg=(0, 0, 0)):
     c = st["counts"]
     folder = local_folder(st)
     n, size = du(folder)
@@ -233,7 +266,11 @@ def report(st, mover=None):
     print(f"Папка на Диске:  {st['scope']}")
     print(f"Найдено файлов:  {c['files']} (из них фото/видео {c['media']}), папок {c['dirs']}")
     print(f"Скачано:         {c['done']} файлов, {human(c['done_bytes'])}")
-    print(f"Ошибок:          {c['failed']}")
+    if dmg[0]:
+        print(f"  из них повреждены на Диске: {dmg[0]} (потеряно {human(dmg[1])}, дыры заполнены нулями)")
+    print(f"Ошибок:          {c['failed']}" + (f" (из них не читаются совсем: {dmg[2]})" if dmg[2] else ""))
+    if dmg[0] or dmg[2]:
+        print(f"Список повреждённых: {REPORT_NAME} в папке со скачанным")
     print(f"На диске сервера: {folder}")
     print(f"                 {n} файлов, {human(size)} ({size} байт)")
     if mover:
@@ -248,7 +285,7 @@ def report(st, mover=None):
     print("=" * 70)
 
 
-def run(folder, dest, dump_dir, no_crawl=False, mover=None, threads=None):
+def run(folder, dest, dump_dir, no_crawl=False, mover=None, threads=None, retry_failed=False):
     if mover:
         mover.check()
     check_auth()
@@ -261,6 +298,8 @@ def run(folder, dest, dump_dir, no_crawl=False, mover=None, threads=None):
     sc = api("/api/fl/scope", {"folder": folder}, ok_codes=(200, 400))
     if not sc.get("ok"):
         raise Fail(f"папка на Диске «{folder}»: {sc.get('error')}")
+    if retry_failed:
+        log(f"файлы с ошибками — в очередь заново: {api('/api/fl/retry-failed', {}).get('reset')}")
     settings = {"include_media": True}
     if threads:
         settings["threads"] = threads
@@ -301,21 +340,16 @@ def run(folder, dest, dump_dir, no_crawl=False, mover=None, threads=None):
         raise Fail(f"не хватит места: нужно {human(c['remaining_bytes'])}, свободно {human(free)}. "
                    "Можно качать частями с переносом в облако: --rclone имя:папка")
 
-    for rnd in (1, 2):
-        st = download_round(mover)
-        if (st.get("message") or "").startswith("Остановился"):
-            if mover:
-                mover.move(st)
-            report(st, mover)
-            raise Fail("скачивание прервалось из-за входа в Яндекс: войди заново через «yandexdl vnc», "
-                       "открой Диск и повтори «yandexdl fetch … --no-crawl» — уже скачанное не перекачается")
-        if not st["counts"]["failed"] or rnd == 2:
-            break
-        n = api("/api/fl/retry-failed", {}).get("reset")
-        log(f"повторяю {n} файлов с ошибками")
+    st = download_round(mover)
+    dmg = damage_report(st)
     if mover:
         mover.move(st)
-    report(st, mover)
+    report(st, mover, dmg)
+    if (st.get("message") or "").startswith("Остановился"):
+        raise Fail("скачивание прервалось из-за входа в Яндекс: войди заново через «yandexdl vnc», "
+                   "открой Диск и повтори «yandexdl fetch … --no-crawl» — уже скачанное не перекачается")
+    if st["counts"]["failed"]:
+        print("Повторить файлы с ошибками: та же команда с --no-crawl --retry-failed")
     return 0 if not st["counts"]["failed"] else 1
 
 
@@ -344,6 +378,7 @@ def main():
     p.add_argument("--reserve-gb", type=float, default=2.0, help="с --rclone: сколько места оставлять свободным")
     p.add_argument("--part-gb", type=float, help="с --rclone: переносить каждые столько скачанных ГБ")
     p.add_argument("--threads", type=int, help="сколько файлов качать одновременно (1–8)")
+    p.add_argument("--retry-failed", action="store_true", help="ещё раз попробовать файлы, которые не скачались")
     a = p.parse_args()
     try:
         if a.status:
@@ -352,7 +387,8 @@ def main():
         if not a.folder:
             p.error("--folder обязателен")
         mover = Mover(a.rclone, a.reserve_gb, a.part_gb) if a.rclone else None
-        return run(a.folder, a.dest, a.dump_dir, no_crawl=a.no_crawl, mover=mover, threads=a.threads)
+        return run(a.folder, a.dest, a.dump_dir, no_crawl=a.no_crawl, mover=mover, threads=a.threads,
+                   retry_failed=a.retry_failed)
     except Fail as e:
         print(f"\nОшибка: {e}", flush=True)
         return 3
