@@ -170,6 +170,7 @@ class FolderCrawler(QObject):
     START_DELAY_TICKS = 3   # новой вкладке дать время: перехват подключается к ней раз в ~2 с
     LOAD_TIMEOUT = 60       # сек: страница так и не загрузилась — идём дальше
     FOLDER_TIMEOUT = 600    # сек: потолок на одну папку
+    EMPTY_MIN_SECONDS = 15  # сек: папку без единого файла не считать дочитанной раньше — список мог ещё не прийти
 
     def __init__(self, window):
         super().__init__(window)
@@ -278,7 +279,8 @@ class FolderCrawler(QObject):
             self.stable += 1
         else:
             self.stable, self.last_fresh = 0, fresh
-        if self.stable >= self.STABLE_TICKS or elapsed > self.FOLDER_TIMEOUT:
+        settled = self.stable >= self.STABLE_TICKS and (info.get("children") or elapsed >= self.EMPTY_MIN_SECONDS)
+        if settled or elapsed > self.FOLDER_TIMEOUT:
             self._api("/api/fl/folder-done", {"path": self.current})
             self.win._on_log(f"[обход] {self.current}: в папке {info.get('children', '?')} файлов/папок")
             self._reset_folder()
@@ -469,6 +471,7 @@ class MainWindow(QMainWindow):
 
     def _on_log(self, text: str):
         self.log_dock.append_log(text)
+        print(text, flush=True)   # и в консоль/журнал — на сервере без экрана лог иначе не увидеть
 
     def _on_stats(self, d: dict):
         self.log_dock.update_stats(d)

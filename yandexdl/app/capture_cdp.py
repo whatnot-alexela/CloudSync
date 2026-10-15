@@ -55,6 +55,14 @@ JSON_SCRIPT_RE = re.compile(r'<script[^>]*type=["\']application/json["\'][^>]*>(
 
 MAX_BUFFERED_REQUESTS = 800  # на одну вкладку
 
+# Диагностика: если задано, ответы /models* и HTML страниц Диска сохраняются сюда как есть —
+# по ним видно, в каком виде Диск отдаёт список папки (vps/diagnose.py их разбирает).
+DUMP_DIR = os.environ.get("YDISK_CAPTURE_DUMP") or None
+DUMP_MAX_FILES = 400
+DUMP_MAX_BYTES = 5 * 1024 * 1024
+_dump_lock = threading.Lock()
+_dump_seq = [0]
+
 
 def is_yandex_host(host: str) -> bool:
     if not host:
@@ -201,6 +209,25 @@ def _extract_sk_conn(url: str, post_data: str):
     return (sk if isinstance(sk, str) else None), (conn if isinstance(conn, str) else None)
 
 
+def _dump_response(url, post_data, mode, text, n_found):
+    """Сохранить ответ для диагностики (sk и connection_id в теле запроса вырезаются)."""
+    if not DUMP_DIR or len(text) > DUMP_MAX_BYTES:
+        return
+    with _dump_lock:
+        if _dump_seq[0] >= DUMP_MAX_FILES:
+            return
+        _dump_seq[0] += 1
+        seq = _dump_seq[0]
+    post = re.sub(r'(\b(?:sk|connection_id)"?\s*[:=]\s*"?)[^"&,}]+', r"\1***", post_data or "")
+    try:
+        os.makedirs(DUMP_DIR, exist_ok=True)
+        name = f"{time.strftime('%Y%m%d-%H%M%S')}-{seq:04d}-{mode}.json"
+        with open(os.path.join(DUMP_DIR, name), "w", encoding="utf-8") as f:
+            json.dump({"url": url, "post": post, "mode": mode, "found": n_found, "body": text}, f, ensure_ascii=False)
+    except OSError:
+        pass
+
+
 def _post_json(url: str, payload: dict, timeout=20):
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"}, method="POST")
@@ -331,6 +358,7 @@ class _TabWatcher(threading.Thread):
         e["url"] = url
         e["host"] = host
         e["is_target_req"] = True
+        e["post"] = req.get("postData")
         sk, conn = _extract_sk_conn(url, req.get("postData"))
         e["sk"], e["connection_id"] = sk, conn
         self._maybe_send_auth(request_id)
@@ -392,6 +420,7 @@ class _TabWatcher(threading.Thread):
             return
         e = self._req_entry(request_id)
         e["resp_host"] = host
+        e["resp_url"] = url
         status = resp.get("status")
         if status == 403:
             self.on_log("[cdp] ⚠️ HTTP 403 — сессия/sk протухли, обнови страницу Диска")
@@ -441,7 +470,7 @@ class _TabWatcher(threading.Thread):
 
     def _fetch_and_ingest(self, request_id, mode):
         result = self._send("Network.getResponseBody", {"requestId": request_id}, wait=True)
-        self._req.pop(request_id, None)
+        e = self._req.pop(request_id, None) or {}
         if not result or "body" not in result:
             if mode == "photo":
                 self.on_log(f"[cdp] не удалось получить тело ответа ({request_id})")
@@ -450,16 +479,21 @@ class _TabWatcher(threading.Thread):
         if result.get("base64Encoded"):
             text = base64.b64decode(text).decode("utf-8", "replace")
         if mode == "html":
-            self._ingest_files(resources_from_html(text))
+            resources = resources_from_html(text)
+            _dump_response(e.get("resp_url"), None, mode, text, len(resources))
+            self._ingest_files(resources)
             return
         try:
             data = json.loads(text)
-        except ValueError as e:
+        except ValueError as err:
+            _dump_response(e.get("resp_url"), e.get("post"), mode, text, 0)
             if mode == "photo":
-                self.on_log(f"[cdp] ответ не JSON: {e}")
+                self.on_log(f"[cdp] ответ не JSON: {err}")
             return
         if mode == "files":
-            self._ingest_files(find_disk_resources(data))
+            resources = find_disk_resources(data)
+            _dump_response(e.get("resp_url"), e.get("post"), mode, text, len(resources))
+            self._ingest_files(resources)
             return
         payload = find_payload(data)
         if payload is None:
