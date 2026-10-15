@@ -72,10 +72,23 @@ cmd_install() {
   for alt in "libasound2t64 libasound2" "libglib2.0-0t64 libglib2.0-0" "libpng16-16t64 libpng16-16"; do
     p=$(pick $alt); if [ -n "$p" ]; then pkgs+=("$p"); fi
   done
-  apt-get install -y -qq "${pkgs[@]}" >/dev/null
+  echo "ставлю ~60 пакетов, это несколько минут…"
+  apt-get install -y -q "${pkgs[@]}" > >(grep --line-buffered '^Setting up' || true)
 
-  python3 -c 'import sys; sys.exit(sys.version_info < (3, 9))' \
-    || die "нужен Python 3.9+ (PySide6), а тут $(python3 -V). Подойдёт Ubuntu 22.04/24.04 или Debian 12"
+  # PySide6 нужен Python 3.9+; на Ubuntu 20.04 системный — 3.8, но в репозитории есть python3.9
+  local py=python3 v
+  if ! python3 -c 'import sys; sys.exit(sys.version_info < (3, 9))'; then
+    for v in 3.12 3.11 3.10 3.9; do
+      if apt-cache show "python$v-venv" >/dev/null 2>&1; then
+        echo "системный $(python3 -V) не подходит — ставлю python$v"
+        apt-get install -y -qq "python$v" "python$v-venv" >/dev/null
+        py=python$v
+        break
+      fi
+    done
+    "$py" -c 'import sys; sys.exit(sys.version_info < (3, 9))' \
+      || die "нужен Python 3.9+ (PySide6), а тут $(python3 -V). Подойдёт Ubuntu 20.04–24.04 или Debian 12"
+  fi
 
   # Chromium внутри Qt на 1 ГБ памяти без подкачки падает — добавим 2 ГБ swap
   local mem_mb swap_mb
@@ -96,9 +109,12 @@ cmd_install() {
   ln -sfn "$APP_DIR/vps/yandexdl-vps.sh" /usr/local/bin/yandexdl
 
   say "Python-окружение (PySide6 качается ~300 МБ, пара минут)"
-  [ -x "$VENV/bin/python" ] || python3 -m venv "$VENV"
+  if [ -x "$VENV/bin/python" ] && ! "$VENV/bin/python" -c 'import sys; sys.exit(sys.version_info < (3, 9))'; then
+    rm -rf "$VENV"
+  fi
+  [ -x "$VENV/bin/python" ] || "$py" -m venv "$VENV"
   "$VENV/bin/pip" install -q --upgrade pip
-  "$VENV/bin/pip" install -q -r "$APP_DIR/requirements.txt"
+  "$VENV/bin/pip" install -r "$APP_DIR/requirements.txt"
 
   say "Службы systemd"
   cat > /etc/systemd/system/yandexdl-xvfb.service <<EOF
