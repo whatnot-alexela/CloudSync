@@ -41,6 +41,7 @@ import time
 import urllib.error
 import urllib.request
 from collections import deque
+from urllib.parse import unquote, urlparse
 from contextlib import contextmanager
 from datetime import datetime, timezone
 
@@ -2360,6 +2361,51 @@ def disk_rel_path(path):
     return "/".join([FILES_SUBDIR] + [_safe_component(p) for p in parts])
 
 
+def normalize_disk_folder(value):
+    """«Творчество», «/Творчество», «/disk/Творчество», «disk:/Творчество» или ссылка из адресной строки
+    https://disk.yandex.ru/client/disk/Творчество -> («/disk/Творчество», None). Пусто — весь Диск («/disk»)."""
+    s = (value or "").strip()
+    if "://" in s:
+        p = unquote(urlparse(s).path)
+        if not (p == "/client/disk" or p.startswith("/client/disk/")):
+            return None, "это не ссылка на папку Диска (нужна вида https://disk.yandex.ru/client/disk/Папка)"
+        s = p[len("/client/disk"):]
+    if s.startswith("disk:"):
+        s = s[len("disk:"):]
+    s = s.strip().strip("/")
+    if s == "disk":
+        s = ""
+    elif s.startswith("disk/"):
+        s = s[len("disk/"):]
+    parts = [p.strip() for p in s.split("/") if p.strip()]
+    if any(p in (".", "..") for p in parts):
+        return None, "в пути не может быть «.» и «..»"
+    return "/disk" + "".join("/" + p for p in parts), None
+
+
+def known_folder_case(folder):
+    """«/disk/творчество» -> «/disk/Творчество», если такая папка уже встречалась: регистр букв на Диске важен."""
+    with dbc() as c:
+        if c.execute("SELECT 1 FROM files WHERE path=? AND kind='dir'", (folder,)).fetchone():
+            return folder
+        low = folder.lower()
+        matches = [r[0] for r in c.execute("SELECT path FROM files WHERE kind='dir'") if r[0].lower() == low]
+    return matches[0] if len(matches) == 1 else folder
+
+
+def _sql_str(s):
+    """Строка как SQL-литерал SQLite (одинарные кавычки удваиваются)."""
+    return "'" + s.replace("'", "''") + "'"
+
+
+def subtree_sql(folder):
+    """Условие «path — сама папка folder или что-то внутри неё». Без LIKE: в именах бывают % и _."""
+    if folder == "/disk":
+        return "1"
+    inside = _sql_str(folder + "/")
+    return f"(path = {_sql_str(folder)} OR substr(path, 1, length({inside})) = {inside})"
+
+
 def _with_tag(rel, path):
     stem, ext = os.path.splitext(rel)
     return f"{stem}_{hashlib.md5(path.encode('utf-8')).hexdigest()[:8]}{ext}"
@@ -2410,11 +2456,13 @@ class FileDownloader:
     Ссылку берёт так же, как загрузка видео: models-v2?m=mpfs/url с куками и sk из auth.db.
     Обрыв или просроченная ссылка — новая ссылка и докачка с места обрыва (Range), до FL_ATTEMPTS попыток.
     Фото и видео из папок по умолчанию пропускает (их качают вкладки «Фото» и «Видео»), это настраивается.
+    scope — папка, внутри которой работают загрузка и обход (по умолчанию весь Диск).
     """
 
     def __init__(self):
         self.threads = FL_DEFAULT_THREADS
         self.include_media = False
+        self.scope = "/disk"
         self.stop_event = threading.Event()
         self.stop_event.set()
         self.finishing = threading.Event()
@@ -2431,8 +2479,12 @@ class FileDownloader:
         self.message = ""
         self.opener = build_opener()
 
+    def scope_sql(self):
+        return subtree_sql(self.scope)
+
     def eligible(self):
-        return "kind='file' AND fl_status IS NULL" + ("" if self.include_media else " AND COALESCE(is_media,0)=0")
+        return (f"kind='file' AND fl_status IS NULL AND {self.scope_sql()}"
+                + ("" if self.include_media else " AND COALESCE(is_media,0)=0"))
 
     # ---------- настройки
 
@@ -2442,6 +2494,20 @@ class FileDownloader:
         except (TypeError, ValueError):
             self.threads = FL_DEFAULT_THREADS
         self.include_media = get_setting("fl_include_media", "0") == "1"
+        scope, err = normalize_disk_folder(get_setting("fl_scope", "/disk"))
+        self.scope = scope if not err else "/disk"
+
+    def set_scope(self, value):
+        """Выбрать папку, внутри которой работают загрузка и обход. Пусто — весь Диск."""
+        if self.state() != "idle" or CRAWL.run:
+            return None, "сначала останови загрузку файлов и обход, потом меняй папку"
+        folder, err = normalize_disk_folder(value)
+        if err:
+            return None, err
+        folder = known_folder_case(folder)
+        self.scope = folder
+        set_setting("fl_scope", folder)
+        return folder, None
 
     def update_settings(self, body):
         errors = []
@@ -2707,6 +2773,7 @@ class FileDownloader:
 
     def snapshot(self):
         elig = self.eligible()
+        scope = self.scope_sql()
         with dbc() as c:
             r = c.execute(
                 f"""SELECT
@@ -2722,7 +2789,7 @@ class FileDownloader:
                     COALESCE(SUM({elig}),0),
                     COALESCE(SUM(CASE WHEN {elig} THEN size END),0),
                     COALESCE(SUM(CASE WHEN fl_status='done' THEN fl_bytes END),0)
-                FROM files"""
+                FROM files WHERE {scope}"""
             ).fetchone()
             counts = dict(zip(
                 ["files", "media", "dirs", "dirs_unopened", "dirs_crawled", "done", "failed", "queued",
@@ -2732,13 +2799,13 @@ class FileDownloader:
             recent_done = [
                 {"path": x["path"], "bytes": x["fl_bytes"], "note": x["fl_note"], "file": x["fl_file"], "at": x["fl_at"]}
                 for x in c.execute("SELECT path,fl_bytes,fl_note,fl_file,fl_at FROM files WHERE fl_status='done' "
-                                   "ORDER BY fl_at DESC, path DESC LIMIT 25")]
+                                   f"AND {scope} ORDER BY fl_at DESC, path DESC LIMIT 25")]
             recent_failed = [
                 {"path": x["path"], "error": x["fl_error"], "at": x["fl_at"]}
                 for x in c.execute("SELECT path,fl_error,fl_at FROM files WHERE fl_status='failed' "
-                                   "ORDER BY fl_at DESC, path DESC LIMIT 25")]
+                                   f"AND {scope} ORDER BY fl_at DESC, path DESC LIMIT 25")]
             unopened = [x[0] for x in c.execute(
-                "SELECT path FROM files WHERE kind='dir' AND listed_at IS NULL ORDER BY path LIMIT 30")]
+                f"SELECT path FROM files WHERE kind='dir' AND listed_at IS NULL AND {scope} ORDER BY path LIMIT 30")]
 
         now = time.monotonic()
         try:
@@ -2759,6 +2826,7 @@ class FileDownloader:
             "threads": self.threads,
             "max_threads": FL_MAX_THREADS,
             "include_media": self.include_media,
+            "scope": self.scope,
             "queue_size": FL_QUEUE_SIZE,
             "files_dir": os.path.join(os.path.abspath(files_dir()), FILES_SUBDIR),
             "speed": speed,
@@ -2804,7 +2872,7 @@ class CrawlState:
     def set_run(self, run, message=None, reset=False):
         if reset:
             with dbc() as c:
-                c.execute("UPDATE files SET crawled_at=NULL WHERE kind='dir'")
+                c.execute(f"UPDATE files SET crawled_at=NULL WHERE kind='dir' AND {FL.scope_sql()}")
         with self.lock:
             if run and not self.run:
                 self.visited = 0
@@ -2817,14 +2885,16 @@ class CrawlState:
                 self.message = ""
 
     def next_folder(self):
-        """Следующая непройденная папка (сначала верхние уровни). Ни одной папки ещё нет — корень /disk."""
+        """Следующая непройденная папка внутри выбранной (FL.scope), сначала верхние уровни.
+        Саму выбранную папку ещё ни разу не видели — начинаем с неё."""
+        scope = FL.scope
         with dbc() as c:
             row = c.execute(
-                "SELECT path FROM files WHERE kind='dir' AND crawled_at IS NULL "
+                f"SELECT path FROM files WHERE kind='dir' AND crawled_at IS NULL AND {subtree_sql(scope)} "
                 "ORDER BY length(path) - length(replace(path, '/', '')), path LIMIT 1").fetchone()
             path = row[0] if row else None
-            if path is None and not c.execute("SELECT 1 FROM files WHERE path='/disk'").fetchone():
-                path = "/disk"
+            if path is None and not c.execute("SELECT 1 FROM files WHERE path=?", (scope,)).fetchone():
+                path = scope
         with self.lock:
             self.current = path
             self.current_since = now_iso() if path else None
@@ -2968,6 +3038,14 @@ def api_fl_settings():
 @app.post("/api/fl/retry-failed")
 def api_fl_retry_failed():
     return jsonify(ok=True, reset=FL.retry_failed())
+
+
+@app.post("/api/fl/scope")
+def api_fl_scope():
+    folder, err = FL.set_scope((request.get_json(silent=True) or {}).get("folder", ""))
+    if err:
+        return jsonify(ok=False, error=err), 400
+    return jsonify(ok=True, scope=folder)
 
 
 @app.get("/api/fl/crawl")
@@ -3198,6 +3276,13 @@ STATUS_HTML = r"""<!doctype html>
   <h3>Откуда берётся список файлов</h3>
   <div class="mut">Открой во вкладке браузера раздел «Файлы» на Диске и заходи в папки, прокручивая каждую до конца, —
     перехват запомнит, что в них лежит. Или запусти обход: приложение само откроет все папки по очереди в отдельной вкладке «Обход».</div>
+  <div class="controls">
+    <span class="mut">только папка на Диске:</span>
+    <input id="fScope" type="text" style="min-width:320px" placeholder="весь Диск; например: Творчество или ссылка на папку">
+    <button id="fScopeApply">Выбрать</button>
+    <button id="fScopeAll">Весь Диск</button>
+  </div>
+  <div class="mut" id="fScopeMsg"></div>
   <div class="controls">
     <span id="cstate" class="pill">…</span>
     <button id="cStart">Обойти все папки</button>
@@ -3439,8 +3524,19 @@ STATUS_HTML = r"""<!doctype html>
   }
 
   // ---------------- файлы
-  let fThreadsDirty = false;
+  let fThreadsDirty = false, fScopeDirty = false, fScopeNote = '';
   $('fThreads').addEventListener('input', () => { fThreadsDirty = true; });
+  $('fScope').addEventListener('input', () => { fScopeDirty = true; });
+  async function setScope(folder) {
+    const r = await api('/api/fl/scope', { folder });
+    fScopeDirty = false;
+    fScopeNote = r.ok ? '' : 'Ошибка: ' + r.error;
+    $('fScopeMsg').textContent = fScopeNote; $('fScopeMsg').className = r.ok ? 'mut' : 'err';
+    $('fScope').blur(); refresh();
+  }
+  $('fScopeApply').onclick = () => setScope($('fScope').value);
+  $('fScopeAll').onclick = () => setScope('');
+  $('fScope').addEventListener('keydown', (e) => { if (e.key === 'Enter') setScope($('fScope').value); });
 
   function renderF(s) {
     const c = s.counts, cr = s.crawl;
@@ -3464,6 +3560,18 @@ STATUS_HTML = r"""<!doctype html>
       $('fAuth').className = 'warn';
     }
     $('fMsg').hidden = !s.message; $('fMsg').textContent = s.message || '';
+
+    const scopeName = s.scope === '/disk' ? '' : s.scope.slice('/disk/'.length);
+    if (document.activeElement !== $('fScope') && !fScopeDirty) $('fScope').value = scopeName;
+    $('fScopeApply').disabled = $('fScopeAll').disabled = s.state !== 'idle' || cr.run;
+    $('cStart').textContent = scopeName ? `Обойти «${scopeName}» с подпапками` : 'Обойти все папки';
+    if (!fScopeNote) {
+      const empty = scopeName && !cr.run && c.dirs_crawled > 0 && c.files === 0;
+      $('fScopeMsg').textContent = !scopeName ? 'Сейчас: весь Диск.'
+        : empty ? `В «${scopeName}» ничего не нашлось. Проверь название (регистр букв важен) — проще открыть папку во вкладке Диска и вставить сюда ссылку из адресной строки.`
+        : `Сейчас: только «${scopeName}» и её подпапки — обход, счётчики и загрузка.`;
+      $('fScopeMsg').className = empty ? 'warn' : 'mut';
+    }
 
     $('cstate').textContent = cr.run ? (cr.agent ? 'обход идёт' : 'обход ждёт окно приложения') : 'обход остановлен';
     $('cstate').className = 'pill ' + (cr.run ? (cr.agent ? 'running' : 'stopping') : 'idle');
