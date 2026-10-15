@@ -183,7 +183,8 @@ cmd_stop() {
 }
 
 firewall() {   # firewall open|close — открыть/закрыть порт noVNC, если включён ufw
-  command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q '^Status: active' || return 0
+  command -v ufw >/dev/null || return 0
+  case "$(ufw status 2>/dev/null)" in "Status: active"*) ;; *) return 0 ;; esac
   if [ "$1" = open ]; then ufw allow "$WEB_PORT/tcp" >/dev/null; else ufw delete allow "$WEB_PORT/tcp" >/dev/null || true; fi
 }
 
@@ -197,7 +198,9 @@ cmd_vnc() {
     openssl req -x509 -newkey rsa:2048 -nodes -days 30 -subj "/CN=$ip" -addext "subjectAltName=IP:$ip" \
       -keyout "$VNC_DIR/key.pem" -out "$VNC_DIR/cert.pem" >/dev/null 2>&1
   fi
-  pw=$(tr -dc 'A-HJ-NP-Za-km-z2-9' </dev/urandom | head -c 8)   # VNC берёт не больше 8 символов
+  # VNC берёт не больше 8 символов. Не «tr </dev/urandom | head»: при pipefail tr падает от SIGPIPE
+  pw=$(head -c 600 /dev/urandom | LC_ALL=C tr -dc 'A-HJ-NP-Za-km-z2-9')
+  pw=${pw:0:8}
   x11vnc -storepasswd "$pw" "$VNC_DIR/passwd" >/dev/null 2>&1
   systemctl restart yandexdl-x11vnc yandexdl-novnc
   firewall open
