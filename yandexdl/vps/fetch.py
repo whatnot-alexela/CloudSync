@@ -33,15 +33,21 @@ def api(path, body=None, ok_codes=(200,)):
     data, headers = None, {}
     if body is not None:
         data, headers = json.dumps(body).encode("utf-8"), {"Content-Type": "application/json"}
-    req = urllib.request.Request(API + path, data=data, headers=headers, method="POST" if body is not None else "GET")
-    try:
-        with _OPENER.open(req, timeout=30) as resp:
-            return json.loads(resp.read())
-    except urllib.error.HTTPError as e:
-        payload = json.loads(e.read() or b"{}")
-        if e.code in ok_codes:
-            return payload
-        raise Fail(f"{path}: HTTP {e.code} {payload.get('error') or payload}")
+    for attempt in range(1, 11):
+        req = urllib.request.Request(API + path, data=data, headers=headers, method="POST" if body is not None else "GET")
+        try:
+            with _OPENER.open(req, timeout=60) as resp:
+                return json.loads(resp.read())
+        except urllib.error.HTTPError as e:
+            payload = json.loads(e.read() or b"{}")
+            if e.code in ok_codes:
+                return payload
+            raise Fail(f"{path}: HTTP {e.code} {payload.get('error') or payload}")
+        except OSError as e:   # программа занята или перезапускается: подождать и спросить снова
+            if attempt == 10:
+                raise
+            print(time.strftime("%H:%M:%S"), f"(!) программа не ответила ({e}), повторяю через 30 с", flush=True)
+            time.sleep(30)
 
 
 def human(n):
@@ -392,8 +398,8 @@ def main():
     except Fail as e:
         print(f"\nОшибка: {e}", flush=True)
         return 3
-    except urllib.error.URLError as e:
-        print(f"\nОшибка: API программы не отвечает ({e.reason}) — «yandexdl start»", flush=True)
+    except OSError as e:
+        print(f"\nОшибка: API программы не отвечает ({e}) — «yandexdl start»", flush=True)
         return 3
 
 
