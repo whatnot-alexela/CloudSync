@@ -7,7 +7,9 @@ mitmproxy-аддон для Яндекс Диска.
 2. Запоминает авторизацию, с которой браузер ходит в models-v2: заголовок Cookie, токен sk,
    connection_id и User-Agent, а также обновления кук из Set-Cookie. Всё это уходит на POST /api/auth
    и лежит в отдельной базе auth.db. По этим данным сервер сам запрашивает ссылки на скачивание
-   видео (models-v2?m=mpfs/url).
+   видео и файлов (models-v2?m=mpfs/url).
+3. Раздел «Файлы»: из остальных ответов /models* (и /models/?_m=…, и /models-v2?m=…) и из HTML страниц
+   Диска вытаскивает ресурсы /disk/… (файлы и папки) и шлёт на POST /api/ingest-files.
 
 Запуск:
     mitmdump -s capture_addon.py --listen-host 127.0.0.1 --listen-port 8000
@@ -18,6 +20,7 @@ mitmproxy-аддон для Яндекс Диска.
 Ответ клиенту не меняется — аддон только читает. Значения кук в логи не пишутся.
 """
 import hashlib
+import html
 import json
 import os
 import re
@@ -31,11 +34,13 @@ from mitmproxy import ctx, http
 
 SERVER_URL = os.environ.get("YDISK_SERVER_URL", "http://127.0.0.1:8001/api/ingest")
 AUTH_URL = os.environ.get("YDISK_AUTH_URL", SERVER_URL.rsplit("/api/", 1)[0] + "/api/auth")
-TARGET_PATH_PREFIX = "/models-v2"
+FILES_URL = os.environ.get("YDISK_FILES_URL", SERVER_URL.rsplit("/api/", 1)[0] + "/api/ingest-files")
+TARGET_PATH_PREFIX = "/models"   # и /models/?_m=…, и /models-v2?m=…
 TARGET_MODEL = "photo-get-clusters-with-resources"
 YANDEX_BASES = ("yandex.ru", "yandex.com", "ya.ru", "yandex.net")
 SK_RE = re.compile(r'"sk"\s*:\s*"([^"]+)"')
 CID_RE = re.compile(r'"connection_id"\s*:\s*"([^"]+)"')
+JSON_SCRIPT_RE = re.compile(r'<script[^>]*type=["\']application/json["\'][^>]*>(.*?)</script>', re.S | re.I)
 
 
 def is_yandex_host(host: str) -> bool:
@@ -68,6 +73,38 @@ def find_payload(obj):
             if found is not None:
                 return found
     return None
+
+
+def find_disk_resources(obj, out=None):
+    """Все ресурсы /disk/… (файлы и папки) в любом JSON — так выглядят списки папок раздела «Файлы»."""
+    if out is None:
+        out = []
+    if isinstance(obj, dict):
+        path = obj.get("path") or obj.get("id")
+        if (isinstance(path, str) and (path == "/disk" or path.startswith("/disk/"))
+                and (obj.get("type") in ("file", "dir") or isinstance(obj.get("meta"), dict))):
+            out.append(obj)
+            return out
+        for value in obj.values():
+            find_disk_resources(value, out)
+    elif isinstance(obj, list):
+        for value in obj:
+            find_disk_resources(value, out)
+    return out
+
+
+def resources_from_html(text):
+    """Ресурсы из <script type="application/json"> страницы Диска (состояние, вшитое при загрузке)."""
+    out = []
+    for block in JSON_SCRIPT_RE.findall(text or ""):
+        for candidate in (block, html.unescape(block)):
+            try:
+                data = json.loads(candidate)
+            except ValueError:
+                continue
+            find_disk_resources(data, out)
+            break
+    return out
 
 
 # ---------------------------------------------------------------- куки и токен
@@ -162,11 +199,12 @@ class YDiskCapture:
         self._lock = threading.Lock()
 
     def running(self):
-        ctx.log.info(f"[ydisk] аддон загружен (с авторизацией): ingest -> {SERVER_URL}, auth -> {AUTH_URL}")
+        ctx.log.info(f"[ydisk] аддон загружен (с авторизацией): ingest -> {SERVER_URL}, auth -> {AUTH_URL}, "
+                     f"файлы -> {FILES_URL}")
 
-    def _send(self, body: bytes):
+    def _send(self, body: bytes, url: str = SERVER_URL):
         req = urllib.request.Request(
-            SERVER_URL,
+            url,
             data=body,
             headers={"Content-Type": "application/json"},
             method="POST",
@@ -176,7 +214,7 @@ class YDiskCapture:
                 result = resp.read().decode("utf-8", "replace")
             ctx.log.info(f"[ydisk] сервер ответил: {result}")
         except Exception as e:  # noqa: BLE001
-            ctx.log.error(f"[ydisk] не удалось отправить на {SERVER_URL}: {e}")
+            ctx.log.error(f"[ydisk] не удалось отправить на {url}: {e}")
 
     # ---------- авторизация
 
@@ -239,6 +277,32 @@ class YDiskCapture:
         if items:
             self._send_auth({"host": host, "set_cookies": items})
 
+    # ---------- списки папок (раздел «Файлы»)
+
+    def _send_files(self, resources):
+        if not resources:
+            return
+        n_dirs = sum(1 for r in resources if r.get("type") == "dir")
+        ctx.log.info(f"[ydisk] перехвачен список папки: файлов={len(resources) - n_dirs}, папок={n_dirs}")
+        body = json.dumps({"resources": resources}, ensure_ascii=False).encode("utf-8")
+        threading.Thread(target=self._send, args=(body, FILES_URL), daemon=True).start()
+
+    def _capture_files(self, flow: http.HTTPFlow):
+        if flow.response.status_code != 200:
+            return
+        try:
+            data = json.loads(flow.response.text)
+        except Exception:  # noqa: BLE001
+            return
+        self._send_files(find_disk_resources(data))
+
+    def _capture_files_from_html(self, flow: http.HTTPFlow):
+        if flow.response.status_code != 200 or "disk.yandex" not in flow.request.pretty_host.lower():
+            return
+        if "text/html" not in (flow.response.headers.get("Content-Type") or ""):
+            return
+        self._send_files(resources_from_html(flow.response.get_text(strict=False)))
+
     # ---------- ответы
 
     def response(self, flow: http.HTTPFlow):
@@ -249,6 +313,7 @@ class YDiskCapture:
         if not is_yandex_host(req.pretty_host):
             return
         if not req.path.startswith(TARGET_PATH_PREFIX):
+            self._capture_files_from_html(flow)
             return
 
         # Обработка HTTP 403 — сессия или sk протухли
@@ -263,6 +328,7 @@ class YDiskCapture:
 
         # req.path включает query-string, модель может быть url-encoded (intapi%2Fphoto-...)
         if TARGET_MODEL not in req.path:
+            self._capture_files(flow)
             return
         if flow.response.status_code != 200:
             return

@@ -63,10 +63,12 @@ class ServerThread(threading.Thread):
         mod.load_files_dir_setting()
         os.makedirs(mod.files_dir(), exist_ok=True)
         os.makedirs(mod.THUMBS_DIR, exist_ok=True)
-        self.on_log(f"[server] проверка существующих файлов: {mod.reconcile_existing_downloads()}")
+        self.on_log(f"[server] проверка существующих файлов: {mod.reconcile_existing_downloads()}, "
+                    f"из раздела «Файлы» уже на диске: {mod.reconcile_existing_files()}")
         mod.cleanup_part_files()
         mod.DL.load_settings()
         mod.VD.load_settings()
+        mod.FL.load_settings()
 
         if not shutil.which("ffmpeg"):
             self.on_log("(!) ffmpeg не найден в PATH — видео собрать не выйдет")

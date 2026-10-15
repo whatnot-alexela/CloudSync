@@ -28,9 +28,13 @@ sys.executable — это НАШ ЖЕ exe (другого питона рядо�
 скачивания видео — и выполняет recover_runner.py напрямую. Это сделано в main.py,
 а не в server.py, именно чтобы server.py не пришлось трогать вообще.
 """
+import json
 import os
 import socket
 import sys
+import time
+import urllib.request
+from urllib.parse import quote
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from paths import resource_dir, ffmpeg_dir  # noqa: E402
@@ -84,6 +88,26 @@ from webauthn_dialog import attach_webauthn_handler  # noqa: E402
 from paths import user_data_dir  # noqa: E402
 
 DEFAULT_NEW_TAB_URL = "https://disk.yandex.ru"
+DISK_FOLDER_URL = "https://disk.yandex.ru/client/disk"   # + путь папки без /disk
+
+# Прокручивает до конца и окно, и все прокручиваемые блоки: список папки на Диске
+# подгружается порциями по мере прокрутки, а в каком именно блоке он лежит — не важно.
+SCROLL_JS = """
+(function () {
+  var els = [document.scrollingElement || document.documentElement];
+  document.querySelectorAll('*').forEach(function (el) {
+    if (el.scrollHeight > el.clientHeight + 20) {
+      var oy = getComputedStyle(el).overflowY;
+      if (oy === 'auto' || oy === 'scroll') els.push(el);
+    }
+  });
+  els.forEach(function (el) { el.scrollTop = el.scrollHeight; });
+  return els.length;
+})();
+"""
+
+# к своему же localhost — напрямую, мимо системного прокси
+_LOCAL_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
 class LogBridge(QObject):
@@ -124,8 +148,157 @@ class LogDock(QDockWidget):
             parts.append(f"кластеров: {d['total_clusters']}")
         if "total_resources" in d:
             parts.append(f"ресурсов: {d['total_resources']}")
+        if "total_files" in d:
+            parts.append(f"из списков папок: {d['total_files']}")
         if parts:
             self.status_label.setText(" · ".join(parts))
+
+
+class FolderCrawler(QObject):
+    """
+    Обход папок для раздела «Файлы». Включается кнопкой на странице статуса (вкладка «Файлы»)
+    или на тулбаре — флаг хранит сервер (/api/fl/crawl), окно его опрашивает. Пока флаг стоит,
+    папки Диска по одной открываются в отдельной вкладке и прокручиваются до конца; списки файлов
+    забирает обычный перехват (capture_cdp), как при ручном просмотре. Какую папку открыть следующей
+    и что уже пройдено — решает сервер (/api/fl/next-folder, /api/fl/folder-done).
+
+    Папка считается дочитанной, когда STABLE_TICKS тиков подряд с сервера не приходит ничего нового
+    из её содержимого (прокрутка больше не подгружает порции).
+    """
+    TICK_MS = 1500
+    STABLE_TICKS = 3        # тиков подряд без новых файлов папки — папка дочитана
+    START_DELAY_TICKS = 3   # новой вкладке дать время: перехват подключается к ней раз в ~2 с
+    LOAD_TIMEOUT = 60       # сек: страница так и не загрузилась — идём дальше
+    FOLDER_TIMEOUT = 600    # сек: потолок на одну папку
+
+    def __init__(self, window):
+        super().__init__(window)
+        self.win = window
+        self.view = None
+        self.running = False
+        self._reset_folder()
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self._tick)
+
+    def start(self):
+        self.timer.start(self.TICK_MS)
+
+    def stop(self):
+        self.timer.stop()
+
+    def _reset_folder(self):
+        self.current = None
+        self.since = None
+        self.last_fresh = -1
+        self.stable = 0
+        self.started = 0.0
+        self.loading = False
+        self.wait_ticks = 0
+
+    def _api(self, path, body=None):
+        base = self.win.server_thread.base_url
+        if not base:
+            return None
+        data, headers = None, {}
+        if body is not None:
+            data, headers = json.dumps(body).encode("utf-8"), {"Content-Type": "application/json"}
+        req = urllib.request.Request(base + path, data=data, headers=headers,
+                                     method="POST" if body is not None else "GET")
+        try:
+            with _LOCAL_OPENER.open(req, timeout=3) as resp:
+                return json.loads(resp.read())
+        except Exception:  # noqa: BLE001 — сервер ещё не поднялся или перезапускается
+            return None
+
+    def toggle(self):
+        st = self._api("/api/fl/crawl")
+        if st is not None:
+            self._api("/api/fl/crawl", {"run": not st.get("run")})
+
+    def _finish(self, message):
+        self._api("/api/fl/crawl", {"run": False, "message": message})
+        self.win._on_log(f"[обход] {message}")
+
+    def _view_open(self):
+        if self.view is None:
+            return False
+        try:
+            return self.win.tabs.indexOf(self.view) >= 0
+        except RuntimeError:     # C++-объект вкладки уже удалён
+            return False
+
+    def _tick(self):
+        st = self._api("/api/fl/crawl?agent=1")   # заодно сообщает странице статуса, что обход есть кому выполнять
+        if st is None:
+            return
+        run = bool(st.get("run"))
+        self.win.crawl_btn.setText("Остановить обход" if run else "Обойти папки")
+        if not run:
+            if self.running:
+                self.win._on_log("[обход] остановлен")
+            self.running = False
+            self._reset_folder()
+            return
+        if not self.running:
+            self.running = True
+            self.win._on_log("[обход] начинаю обход папок Диска")
+            if self.view is not None and not self._view_open():
+                self.view = None
+        if self.view is None:
+            self._open_tab()
+            return
+        if not self._view_open():
+            self.view = None
+            self._finish("остановлен: вкладку «Обход» закрыли")
+            return
+        if self.wait_ticks > 0:
+            self.wait_ticks -= 1
+            return
+
+        if self.current is None:
+            nxt = self._api("/api/fl/next-folder", {}) or {}
+            if not nxt.get("path"):
+                self._finish("готово: все найденные папки пройдены")
+                return
+            self._visit(nxt["path"], nxt.get("since"))
+            return
+
+        elapsed = time.monotonic() - self.started
+        if self.loading and elapsed < self.LOAD_TIMEOUT:
+            return
+        url = self.view.url()
+        if "disk.yandex" not in url.host() or not url.path().startswith("/client/"):
+            self._finish("остановлен: Диск попросил войти или пройти проверку — сделай это во вкладке "
+                         "«Обход» и запусти обход снова")
+            return
+        self.view.page().runJavaScript(SCROLL_JS)
+        info = self._api(f"/api/fl/folder?path={quote(self.current)}&since={quote(self.since or '')}") or {}
+        fresh = info.get("fresh", -1)
+        if fresh == self.last_fresh:
+            self.stable += 1
+        else:
+            self.stable, self.last_fresh = 0, fresh
+        if self.stable >= self.STABLE_TICKS or elapsed > self.FOLDER_TIMEOUT:
+            self._api("/api/fl/folder-done", {"path": self.current})
+            self.win._on_log(f"[обход] {self.current}: в папке {info.get('children', '?')} файлов/папок")
+            self._reset_folder()
+
+    def _open_tab(self):
+        self.view = self.win._open_tab(DISK_FOLDER_URL)
+        self.view.loadFinished.connect(self._on_loaded)
+        self._reset_folder()
+        self.wait_ticks = self.START_DELAY_TICKS
+
+    def _visit(self, path, since):
+        self._reset_folder()
+        self.current, self.since = path, since
+        self.started = time.monotonic()
+        self.loading = True
+        self.view.load(QUrl(DISK_FOLDER_URL + quote(path[len("/disk"):])))
+        self.win._on_log(f"[обход] открываю {path}")
+
+    def _on_loaded(self, ok):
+        self.loading = False
 
 
 class MainWindow(QMainWindow):
@@ -173,6 +346,11 @@ class MainWindow(QMainWindow):
         new_tab_btn.clicked.connect(lambda: self._open_tab(DEFAULT_NEW_TAB_URL))
         toolbar.addWidget(new_tab_btn)
 
+        # обход папок для раздела «Файлы» (то же, что кнопка на странице статуса)
+        self.crawl_btn = QToolButton(text="Обойти папки")
+        self.crawl_btn.setToolTip("Открыть все папки Диска по очереди, чтобы собрать список файлов для вкладки «Файлы»")
+        toolbar.addWidget(self.crawl_btn)
+
         log_btn = QToolButton(text="Лог")
         toolbar.addWidget(log_btn)
 
@@ -210,6 +388,11 @@ class MainWindow(QMainWindow):
             on_stats=self._stats_from_thread,
         )
         QTimer.singleShot(1500, self.capture.start)
+
+        # --- обход папок: ждёт команды со страницы статуса или с тулбара ---
+        self.crawler = FolderCrawler(self)
+        self.crawl_btn.clicked.connect(self.crawler.toggle)
+        QTimer.singleShot(2000, self.crawler.start)
 
     # ---------------------------------------------------------- вкладки
 
@@ -255,6 +438,9 @@ class MainWindow(QMainWindow):
     def _on_title_changed(self, view, title):
         idx = self.tabs.indexOf(view)
         if idx > 0 and title:  # вкладку 0 не переименовываем
+            crawler = getattr(self, "crawler", None)   # первая вкладка открывается раньше, чем он создан
+            if crawler is not None and view is crawler.view:
+                title = "Обход: " + title
             self.tabs.setTabText(idx, title[:24])
 
     def _navigate_from_address_bar(self):
@@ -288,6 +474,7 @@ class MainWindow(QMainWindow):
         self.log_dock.update_stats(d)
 
     def closeEvent(self, event):
+        self.crawler.stop()
         self.capture.stop()
         self.server_thread.stop()
         super().closeEvent(event)

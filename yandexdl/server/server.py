@@ -8,6 +8,9 @@
   GET  /status       — статус загрузки: вкладки «Фото» и «Видео» (#video)
   POST /api/dl/start|stop|threads|retry-failed, GET /api/dl/status — загрузка фото
   POST /api/vd/start|stop|settings|retry-failed, GET /api/vd/status — загрузка видео через recover.py
+  POST /api/ingest-files — ресурсы из списков папок раздела «Файлы» (документы, архивы, музыка…)
+  POST /api/fl/start|stop|settings|retry-failed, GET /api/fl/status — загрузка остальных файлов
+  GET  /api/fl/crawl, POST /api/fl/crawl — обход папок (выполняет окно приложения, см. app/main.py)
   GET  /api/items    — те же данные в JSON
   GET  /api/stats    — статистика
 
@@ -98,8 +101,8 @@ def set_files_dir(path):
     """Проверяет путь и, если он доступен для записи и обе загрузки сейчас
     не идут, переключает files_dir() на него. Существующие уже скачанные
     файлы НЕ переносятся — только новые скачивания пойдут в новую папку."""
-    if DL.state() != "idle" or VD.state() != "idle":
-        return None, "сначала останови загрузку (фото и видео), потом меняй папку"
+    if DL.state() != "idle" or VD.state() != "idle" or FL.state() != "idle":
+        return None, "сначала останови загрузку (фото, видео и файлы), потом меняй папку"
     abspath, err = validate_writable_dir(path)
     if err:
         return None, err
@@ -107,6 +110,7 @@ def set_files_dir(path):
         _files_dir_holder.path = abspath
         set_setting("files_dir", abspath)
     reconcile_existing_downloads()
+    reconcile_existing_files()
     return abspath, None
 
 
@@ -206,10 +210,21 @@ VD_LIMITS = {
     "refine_jobs": (1, 64), "stride_kb": (4, 4096),
 }
 
+# --- остальные файлы Диска (раздел «Файлы»): документы, архивы, музыка и т. д. ---
+FILES_SUBDIR = "Диск"       # files_dir()/Диск/<путь на Диске>, структура папок сохраняется
+FL_QUEUE_SIZE = 50          # сколько файлов ждут в очереди
+FL_DEFAULT_THREADS = 3
+FL_MAX_THREADS = 8
+FL_ATTEMPTS = 5             # попыток на файл: каждая со свежей ссылкой, докачка с места обрыва
+FL_READ_TIMEOUT = 30        # сек: на соединение и на каждый блок данных (общего лимита нет — файлы бывают большими)
+FL_CRAWL_AGENT_TIMEOUT = 6  # сек: окно приложения не спрашивало /api/fl/crawl дольше — считаем, что его нет
+
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 256 * 1024 * 1024
 
 VIDEO_EXT = {"mov", "mp4", "m4v", "avi", "mkv", "3gp", "mts", "webm"}
+IMAGE_EXT = {"jpg", "jpeg", "png", "heic", "heif", "webp", "gif", "bmp", "tif", "tiff", "dng", "cr2", "cr3",
+             "nef", "arw", "orf", "rw2", "raf"}
 NAME_DATE_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2}) (\d{2})-(\d{2})-(\d{2})")
 
 
@@ -264,9 +279,41 @@ def init_db():
         c.execute("CREATE INDEX IF NOT EXISTS idx_items_dl ON items(dl_status)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_items_vd ON items(vd_status)")
         c.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
+        # Раздел «Файлы»: отдельная таблица, чтобы галерея и загрузка фото/видео её не видели.
+        c.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS files (
+                path        TEXT PRIMARY KEY,   -- /disk/Документы/отчёт.pdf
+                parent      TEXT,               -- /disk/Документы (у /disk — NULL)
+                name        TEXT,
+                kind        TEXT,               -- file / dir
+                mediatype   TEXT,               -- document / compressed / audio / image / video / ...
+                mimetype    TEXT,
+                size        INTEGER,            -- байты
+                mtime       INTEGER,            -- время изменения на Диске (unix)
+                resource_id TEXT,
+                is_media    INTEGER,            -- 1 — фото/видео (их по умолчанию качают вкладки «Фото»/«Видео»)
+                raw         TEXT,               -- полный JSON ресурса
+                first_seen  TEXT,
+                updated_at  TEXT,
+                listed_at   TEXT,               -- папка: когда впервые увидели её содержимое
+                crawled_at  TEXT,               -- папка: когда её прошёл автоматический обход
+                fl_status   TEXT,               -- NULL / queued / downloading / done / failed
+                fl_file     TEXT,               -- путь относительно корня, сохранённого в fl_root
+                fl_root     TEXT,
+                fl_bytes    INTEGER,
+                fl_error    TEXT,
+                fl_note     TEXT,
+                fl_at       TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_files_parent ON files(parent);
+            CREATE INDEX IF NOT EXISTS idx_files_fl     ON files(fl_status);
+            """
+        )
         # после перезапуска «зависшие» элементы очереди возвращаем в исходное состояние
         c.execute("UPDATE items SET dl_status=NULL WHERE dl_status IN ('queued','downloading')")
         c.execute("UPDATE items SET vd_status=NULL WHERE vd_status IN ('queued','downloading')")
+        c.execute("UPDATE files SET fl_status=NULL WHERE fl_status IN ('queued','downloading')")
 
 
 # ---------------------------------------------------------------- ingest
@@ -409,6 +456,118 @@ def api_ingest():
         return jsonify(error="expected JSON object"), 400
     result = ingest(payload)
     print(f"[ingest] {result}")
+    return jsonify(result)
+
+
+# ---------------------------------------------------------------- ingest: раздел «Файлы»
+
+def _as_int(v):
+    try:
+        return int(v) if v is not None and v != "" else None
+    except (TypeError, ValueError):
+        return None
+
+
+def is_media_file(name, mediatype):
+    if mediatype in ("image", "video"):
+        return True
+    ext = name.rsplit(".", 1)[-1].lower() if "." in (name or "") else ""
+    return ext in VIDEO_EXT or ext in IMAGE_EXT
+
+
+def parent_of(path):
+    return None if path == "/disk" else (path.rsplit("/", 1)[0] or "/disk")
+
+
+def ingest_files(payload: dict):
+    """
+    Ресурсы из списков папок Диска (перехват находит их в ответах /models* и в HTML страниц Диска).
+    Берём только /disk/… : файлы (type=file или есть meta.size/mimetype) и папки (type=dir).
+    Родительские папки заводим сами — так обход знает о каждой папке, которую уже открывали.
+    """
+    ts = now_iso()
+    n_files = n_dirs = 0
+    file_paths, parents = [], set()
+    with dbc() as c:
+        before = c.execute("SELECT COUNT(*) FROM files WHERE kind='file'").fetchone()[0]
+        for r in payload.get("resources") or []:
+            if not isinstance(r, dict):
+                continue
+            path = r.get("path") or r.get("id")
+            if not isinstance(path, str):
+                continue
+            path = path.rstrip("/") or "/"
+            if path != "/disk" and not path.startswith("/disk/"):
+                continue
+            meta = r.get("meta") if isinstance(r.get("meta"), dict) else {}
+            kind = r.get("type")
+            if kind not in ("file", "dir"):
+                kind = "file" if (meta.get("size") is not None or meta.get("mimetype")) else None
+            if kind is None:
+                continue
+            name = r.get("name") if isinstance(r.get("name"), str) and r.get("name") else name_from_path(path)
+            if path == "/disk":
+                name = FILES_SUBDIR
+            mediatype = meta.get("mediatype") if kind == "file" else None
+            parent = parent_of(path)
+            c.execute(
+                """
+                INSERT INTO files(path, parent, name, kind, mediatype, mimetype, size, mtime, resource_id,
+                                  is_media, raw, first_seen, updated_at)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(path) DO UPDATE SET
+                    parent      = excluded.parent,
+                    name        = excluded.name,
+                    kind        = excluded.kind,
+                    mediatype   = COALESCE(excluded.mediatype, files.mediatype),
+                    mimetype    = COALESCE(excluded.mimetype, files.mimetype),
+                    size        = COALESCE(excluded.size, files.size),
+                    mtime       = COALESCE(excluded.mtime, files.mtime),
+                    resource_id = COALESCE(excluded.resource_id, files.resource_id),
+                    is_media    = MAX(COALESCE(excluded.is_media, 0), COALESCE(files.is_media, 0)),
+                    raw         = excluded.raw,
+                    updated_at  = excluded.updated_at
+                """,
+                (
+                    path, parent, name, kind, mediatype, meta.get("mimetype") if kind == "file" else None,
+                    _as_int(meta.get("size")) if kind == "file" else None, _as_int(r.get("mtime")),
+                    meta.get("resource_id"), int(kind == "file" and is_media_file(name, mediatype)),
+                    json.dumps(r, ensure_ascii=False), ts, ts,
+                ),
+            )
+            if kind == "file":
+                n_files += 1
+                file_paths.append(path)
+            else:
+                n_dirs += 1
+            if parent:
+                parents.add(parent)
+        ancestors = set()
+        for p in parents:
+            q = p
+            while q and q not in ancestors:
+                ancestors.add(q)
+                q = parent_of(q)
+        for p in sorted(ancestors):
+            c.execute("INSERT INTO files(path, parent, name, kind, first_seen, updated_at) VALUES(?,?,?,'dir',?,?) "
+                      "ON CONFLICT(path) DO NOTHING",
+                      (p, parent_of(p), FILES_SUBDIR if p == "/disk" else name_from_path(p), ts, ts))
+        for p in parents:   # содержимое пришло только у непосредственных родителей
+            c.execute("UPDATE files SET listed_at=COALESCE(listed_at, ?) WHERE path=? AND kind='dir'", (ts, p))
+        after = c.execute("SELECT COUNT(*) FROM files WHERE kind='file'").fetchone()[0]
+
+    found = reconcile_existing_files(file_paths) if file_paths else 0
+    return {"files": n_files, "dirs": n_dirs, "new_files": after - before, "already_on_disk": found,
+            "total_files": after}
+
+
+@app.post("/api/ingest-files")
+def api_ingest_files():
+    payload = request.get_json(force=True, silent=True)
+    if not isinstance(payload, dict):
+        return jsonify(error="expected JSON object"), 400
+    result = ingest_files(payload)
+    print(f"[ingest-files] {result}")
     return jsonify(result)
 
 
@@ -2178,6 +2337,514 @@ class VideoDownloader:
 VD = VideoDownloader()
 
 
+# ---------------------------------------------------------------- остальные файлы (раздел «Файлы»)
+
+_WIN_RESERVED = {"CON", "PRN", "AUX", "NUL"} | {f"COM{i}" for i in range(1, 10)} | {f"LPT{i}" for i in range(1, 10)}
+
+
+def _safe_component(part):
+    """Одна часть пути: без запрещённых символов, без «..», без хвостовых точек/пробелов и имён вроде CON (Windows)."""
+    s = safe_name(part).rstrip(" .")
+    if not s:
+        s = "_"
+    if s.split(".", 1)[0].upper() in _WIN_RESERVED:
+        s = "_" + s
+    return s
+
+
+def disk_rel_path(path):
+    """/disk/Папка/отчёт.pdf -> «Диск/Папка/отчёт.pdf» (относительно files_dir())."""
+    parts = [p for p in path.split("/") if p]
+    if parts and parts[0] == "disk":
+        parts = parts[1:]
+    return "/".join([FILES_SUBDIR] + [_safe_component(p) for p in parts])
+
+
+def _with_tag(rel, path):
+    stem, ext = os.path.splitext(rel)
+    return f"{stem}_{hashlib.md5(path.encode('utf-8')).hexdigest()[:8]}{ext}"
+
+
+def reconcile_existing_files(paths=None):
+    """Помечает как done файлы, которые уже лежат в папке загрузок (тот же путь и тот же размер).
+    Как и у фото/видео, статус done потом не сбрасывается, даже если файл удалить вручную."""
+    root = os.path.abspath(files_dir())
+    base = ("SELECT path,size FROM files WHERE kind='file' AND size IS NOT NULL "
+            "AND (fl_status IS NULL OR fl_status='failed')")
+    with dbc() as c:
+        if paths is None:
+            rows = c.execute(base).fetchall()
+        else:
+            rows = []
+            unique = list(dict.fromkeys(str(p) for p in paths if p))
+            for start in range(0, len(unique), 800):
+                batch = unique[start:start + 800]
+                rows.extend(c.execute(f"{base} AND path IN ({','.join('?' * len(batch))})", batch).fetchall())
+        if not rows:
+            return 0
+        claimed = {r[0] for r in c.execute("SELECT fl_file FROM files WHERE fl_status='done' AND fl_file IS NOT NULL")}
+        ts = now_iso()
+        updates = []
+        for row in rows:
+            for rel in (disk_rel_path(row["path"]), _with_tag(disk_rel_path(row["path"]), row["path"])):
+                if rel in claimed:
+                    continue
+                try:
+                    verify_saved_file(root, rel, expected_size=row["size"], min_size=0)
+                except OSError:
+                    continue
+                claimed.add(rel)
+                updates.append((rel, root, row["size"], LOCAL_EXISTING_FILE_NOTE, ts, row["path"]))
+                break
+        c.executemany("UPDATE files SET fl_status='done', fl_file=?, fl_root=?, fl_bytes=?, fl_error=NULL, "
+                      "fl_note=?, fl_at=? WHERE path=?", updates)
+    return len(updates)
+
+
+FL_ORDER = "ORDER BY path"
+
+
+class FileDownloader:
+    """
+    Качает файлы из раздела «Файлы» Диска (документы, архивы, музыка, …) в files_dir()/Диск/<путь>.
+    Ссылку берёт так же, как загрузка видео: models-v2?m=mpfs/url с куками и sk из auth.db.
+    Обрыв или просроченная ссылка — новая ссылка и докачка с места обрыва (Range), до FL_ATTEMPTS попыток.
+    Фото и видео из папок по умолчанию пропускает (их качают вкладки «Фото» и «Видео»), это настраивается.
+    """
+
+    def __init__(self):
+        self.threads = FL_DEFAULT_THREADS
+        self.include_media = False
+        self.stop_event = threading.Event()
+        self.stop_event.set()
+        self.finishing = threading.Event()
+        self.manager = None
+        self.workers = {}
+        self.active = {}
+        self.alock = threading.Lock()
+        self.slock = threading.Lock()
+        self.state_lock = threading.Lock()
+        self.claim_lock = threading.Lock()
+        self.refill_lock = threading.Lock()
+        self.window = deque()
+        self.session = {"done": 0, "failed": 0, "bytes": 0, "started": None}
+        self.message = ""
+        self.opener = build_opener()
+
+    def eligible(self):
+        return "kind='file' AND fl_status IS NULL" + ("" if self.include_media else " AND COALESCE(is_media,0)=0")
+
+    # ---------- настройки
+
+    def load_settings(self):
+        try:
+            self.threads = max(1, min(FL_MAX_THREADS, int(get_setting("fl_threads", FL_DEFAULT_THREADS))))
+        except (TypeError, ValueError):
+            self.threads = FL_DEFAULT_THREADS
+        self.include_media = get_setting("fl_include_media", "0") == "1"
+
+    def update_settings(self, body):
+        errors = []
+        if "threads" in body:
+            try:
+                self.threads = max(1, min(FL_MAX_THREADS, int(body["threads"])))
+                set_setting("fl_threads", self.threads)
+            except (TypeError, ValueError):
+                errors.append("threads")
+        if "include_media" in body:
+            self.include_media = bool(body["include_media"])
+            set_setting("fl_include_media", "1" if self.include_media else "0")
+        return {"threads": self.threads, "include_media": self.include_media}, errors
+
+    # ---------- управление
+
+    def _alive(self):
+        return bool(self.manager and self.manager.is_alive()) or any(t.is_alive() for t in self.workers.values())
+
+    def state(self):
+        if not self._alive():
+            return "idle"
+        return "stopping" if self.stop_event.is_set() else "running"
+
+    def start(self):
+        with self.state_lock:
+            if self._alive():
+                return {"ok": False, "error": "уже запущено" if not self.stop_event.is_set() else "ещё останавливается, подожди"}
+            a = auth_summary()
+            if not a["cookies"] or not a["has_sk"]:
+                return {"ok": False, "error": "нет данных авторизации: открой Яндекс Диск во вкладке браузера "
+                                              "(перехват передаст куки и sk), потом повтори"}
+            self.stop_event.clear()
+            self.finishing.clear()
+            self.message = ""
+            self.workers = {}
+            with self.alock:
+                self.active = {}
+            self.session = {"done": 0, "failed": 0, "bytes": 0, "started": time.time()}
+            self.manager = threading.Thread(target=self._manager_loop, name="fl-manager", daemon=True)
+            self.manager.start()
+        return {"ok": True}
+
+    def stop(self, message=""):
+        if message:
+            self.message = message
+        self.stop_event.set()
+
+    def retry_failed(self):
+        with dbc() as c:
+            return c.execute("UPDATE files SET fl_status=NULL, fl_error=NULL WHERE fl_status='failed'").rowcount
+
+    # ---------- менеджер
+
+    def refill(self):
+        with self.refill_lock:
+            with dbc() as c:
+                have = c.execute("SELECT COUNT(*) FROM files WHERE fl_status='queued'").fetchone()[0]
+                need = FL_QUEUE_SIZE - have
+                if need <= 0:
+                    return
+                rows = c.execute(f"SELECT path FROM files WHERE {self.eligible()} {FL_ORDER} LIMIT ?", (need,)).fetchall()
+                if rows:
+                    ts = now_iso()
+                    c.executemany("UPDATE files SET fl_status='queued', fl_at=? WHERE path=?", [(ts, r[0]) for r in rows])
+
+    def _finished(self):
+        with dbc() as c:
+            r = c.execute(
+                "SELECT COALESCE(SUM(fl_status='queued'),0), COALESCE(SUM(fl_status='downloading'),0), "
+                f"COALESCE(SUM({self.eligible()}),0) FROM files").fetchone()
+        return not any(r)
+
+    def _ensure_workers(self):
+        for idx in range(self.threads):
+            t = self.workers.get(idx)
+            if t is None or not t.is_alive():
+                t = threading.Thread(target=self._worker_loop, args=(idx,), name=f"fl-{idx}", daemon=True)
+                self.workers[idx] = t
+                t.start()
+
+    def _manager_loop(self):
+        natural = False
+        try:
+            while not self.stop_event.is_set():
+                self._ensure_workers()
+                self.refill()
+                if self._finished():
+                    natural = True
+                    break
+                time.sleep(0.5)
+        except Exception as e:  # noqa: BLE001
+            self.message = f"ошибка менеджера: {e}"
+            self.stop_event.set()
+        finally:
+            if natural and not self.message:
+                self.message = "Готово: очередь файлов пуста."
+            self.finishing.set()
+            for t in list(self.workers.values()):
+                t.join(timeout=60)
+            with dbc() as c:
+                c.execute("UPDATE files SET fl_status=NULL WHERE fl_status IN ('queued','downloading')")
+
+    # ---------- воркер
+
+    def _claim(self):
+        with self.claim_lock:
+            with dbc() as c:
+                row = c.execute(
+                    f"SELECT path,name,size,mtime FROM files WHERE fl_status='queued' {FL_ORDER} LIMIT 1").fetchone()
+                if not row:
+                    return None
+                c.execute("UPDATE files SET fl_status='downloading', fl_at=? WHERE path=?", (now_iso(), row["path"]))
+                return dict(row)
+
+    def _worker_loop(self, idx):
+        while not self.stop_event.is_set() and idx < self.threads:
+            row = self._claim()
+            if row is None:
+                if self.finishing.is_set():
+                    break
+                time.sleep(0.3)
+                continue
+            try:
+                self._process(row)
+            except Exception as e:  # noqa: BLE001
+                self._record_fail(row["path"], f"внутренняя ошибка: {type(e).__name__}: {e}")
+            self.refill()
+
+    def _set_file(self, path, status, file=None, nbytes=None, error=None, note=None):
+        saved_root = os.path.abspath(files_dir()) if status == "done" else None
+        with dbc() as c:
+            c.execute("UPDATE files SET fl_status=?, fl_file=?, fl_root=?, fl_bytes=?, fl_error=?, fl_note=?, fl_at=? "
+                      "WHERE path=?",
+                      (status, file, saved_root, nbytes, (error or None) and error[:500], note, now_iso(), path))
+
+    def _on_result(self, ok, nbytes=0):
+        with self.slock:
+            if ok:
+                self.session["done"] += 1
+                self.session["bytes"] += nbytes
+            else:
+                self.session["failed"] += 1
+
+    def _record_fail(self, path, error):
+        self._set_file(path, "failed", error=error)
+        self._on_result(False)
+
+    def _target_rel(self, path):
+        rel = disk_rel_path(path)
+        with dbc() as c:
+            clash = c.execute("SELECT 1 FROM files WHERE lower(fl_file)=lower(?) AND path<>? LIMIT 1",
+                              (rel, path)).fetchone()
+        return _with_tag(rel, path) if clash else rel
+
+    def _wait(self, seconds):
+        if self.stop_event.wait(seconds):
+            raise Aborted()
+
+    def _process(self, row):
+        path, name = row["path"], row["name"]
+        prog = {"name": name, "path": path, "bytes": 0, "total": row.get("size"), "attempt": 1, "of": FL_ATTEMPTS,
+                "since": time.time()}
+        with self.alock:
+            self.active[path] = prog
+        rel = self._target_rel(path)
+        final_path = os.path.join(files_dir(), *rel.split("/"))
+        tmp = os.path.join(os.path.dirname(final_path),
+                           f".{hashlib.md5(path.encode('utf-8')).hexdigest()[:8]}.part")
+        errors = []
+        try:
+            for attempt in range(1, FL_ATTEMPTS + 1):
+                if self.stop_event.is_set():
+                    raise Aborted()
+                prog["attempt"] = attempt
+                try:
+                    nbytes = self._fetch(path, tmp, row.get("size"), prog)
+                    os.replace(tmp, final_path)
+                    verify_saved_file(files_dir(), rel, expected_size=nbytes, min_size=0)
+                except (Aborted, AuthError):
+                    raise
+                except Exception as e:  # noqa: BLE001
+                    # свои ошибки (VideoError, голый OSError) показываем как есть, без имени класса
+                    errors.append(f"{attempt}: {e if isinstance(e, VideoError) or type(e) is OSError else short_err(e)}")
+                    if attempt < FL_ATTEMPTS:
+                        self._wait(min(30, 3 * attempt))
+                    continue
+                mtime = _as_int(row.get("mtime"))
+                if mtime and mtime > 0:
+                    try:
+                        os.utime(final_path, (mtime, mtime))   # дата изменения как на Диске
+                    except (OSError, OverflowError, ValueError):
+                        pass
+                self._set_file(path, "done", file=rel, nbytes=nbytes)
+                self._on_result(True, nbytes)
+                return
+            self._record_fail(path, "; ".join(errors))
+        except Aborted:
+            self._set_file(path, None)
+        except AuthError as e:
+            self._set_file(path, None)
+            self.stop(f"Остановился: {e}")
+        finally:
+            with self.alock:
+                self.active.pop(path, None)
+            if os.path.exists(tmp):
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+
+    def _fetch(self, path, tmp, expected, prog):
+        """Качает файл в tmp (докачивает, если tmp уже есть от прошлой попытки). Возвращает размер."""
+        os.makedirs(os.path.dirname(tmp), exist_ok=True)
+        if expected == 0:            # пустой файл: качать нечего
+            open(tmp, "wb").close()
+            return 0
+        url = get_download_url(path)
+        have = os.path.getsize(tmp) if os.path.exists(tmp) else 0
+        if expected is not None and have >= expected:
+            have = 0
+        headers = {"User-Agent": USER_AGENT, "Accept": "*/*", "Referer": API_BASE + "/"}
+        if have:
+            headers["Range"] = f"bytes={have}-"
+        req = urllib.request.Request(url, headers=headers)
+        try:
+            resp = self.opener.open(req, timeout=FL_READ_TIMEOUT)
+        except urllib.error.HTTPError as e:
+            if e.code == 416 and have:
+                os.remove(tmp)
+                raise IOError("сервер не принял докачку (HTTP 416) — начну заново")
+            raise
+        with resp:
+            if have:
+                content_range = resp.headers.get("Content-Range") or ""
+                if resp.status == 200:
+                    have = 0                 # докачку не поддержали — пишем с начала
+                elif resp.status != 206 or not content_range.startswith(f"bytes {have}-"):
+                    os.remove(tmp)
+                    raise IOError(f"сервер вернул не тот диапазон ({content_range or resp.status})")
+            total = expected
+            if total is None:
+                clen = resp.headers.get("Content-Length")
+                total = have + int(clen) if clen and clen.isdigit() else None
+            got = have
+            prog.update(bytes=got, total=total)
+            with open(tmp, "ab" if have else "wb") as f:
+                while True:
+                    if self.stop_event.is_set():
+                        raise Aborted()
+                    chunk = resp.read(262144)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    got += len(chunk)
+                    prog["bytes"] = got
+                    self.window.append((time.monotonic(), len(chunk)))
+        if total is not None and got != total:
+            raise IOError(f"неполный файл {got}/{total}")
+        return got
+
+    # ---------- статус для страницы
+
+    def snapshot(self):
+        elig = self.eligible()
+        with dbc() as c:
+            r = c.execute(
+                f"""SELECT
+                    COALESCE(SUM(kind='file'),0),
+                    COALESCE(SUM(kind='file' AND COALESCE(is_media,0)=1),0),
+                    COALESCE(SUM(kind='dir'),0),
+                    COALESCE(SUM(kind='dir' AND listed_at IS NULL),0),
+                    COALESCE(SUM(kind='dir' AND crawled_at IS NOT NULL),0),
+                    COALESCE(SUM(fl_status='done'),0),
+                    COALESCE(SUM(fl_status='failed'),0),
+                    COALESCE(SUM(fl_status='queued'),0),
+                    COALESCE(SUM(fl_status='downloading'),0),
+                    COALESCE(SUM({elig}),0),
+                    COALESCE(SUM(CASE WHEN {elig} THEN size END),0),
+                    COALESCE(SUM(CASE WHEN fl_status='done' THEN fl_bytes END),0)
+                FROM files"""
+            ).fetchone()
+            counts = dict(zip(
+                ["files", "media", "dirs", "dirs_unopened", "dirs_crawled", "done", "failed", "queued",
+                 "downloading", "remaining", "remaining_bytes", "done_bytes"], list(r)))
+            queue = [x[0] for x in c.execute(
+                f"SELECT path FROM files WHERE fl_status='queued' {FL_ORDER} LIMIT ?", (FL_QUEUE_SIZE,))]
+            recent_done = [
+                {"path": x["path"], "bytes": x["fl_bytes"], "note": x["fl_note"], "file": x["fl_file"], "at": x["fl_at"]}
+                for x in c.execute("SELECT path,fl_bytes,fl_note,fl_file,fl_at FROM files WHERE fl_status='done' "
+                                   "ORDER BY fl_at DESC, path DESC LIMIT 25")]
+            recent_failed = [
+                {"path": x["path"], "error": x["fl_error"], "at": x["fl_at"]}
+                for x in c.execute("SELECT path,fl_error,fl_at FROM files WHERE fl_status='failed' "
+                                   "ORDER BY fl_at DESC, path DESC LIMIT 25")]
+            unopened = [x[0] for x in c.execute(
+                "SELECT path FROM files WHERE kind='dir' AND listed_at IS NULL ORDER BY path LIMIT 30")]
+
+        now = time.monotonic()
+        try:
+            while self.window and now - self.window[0][0] > 10:
+                self.window.popleft()
+            items = list(self.window)
+        except IndexError:
+            items = []
+        speed = sum(n for _, n in items) / max(1.0, now - items[0][0]) if items else 0
+
+        with self.alock:
+            active = sorted(self.active.values(), key=lambda p: p["since"])
+            active = [dict(p, elapsed=round(time.time() - p["since"], 1)) for p in active]
+
+        return {
+            "state": self.state(),
+            "message": self.message,
+            "threads": self.threads,
+            "max_threads": FL_MAX_THREADS,
+            "include_media": self.include_media,
+            "queue_size": FL_QUEUE_SIZE,
+            "files_dir": os.path.join(os.path.abspath(files_dir()), FILES_SUBDIR),
+            "speed": speed,
+            "auth": auth_summary(),
+            "session": dict(self.session),
+            "counts": counts,
+            "active": active,
+            "queue": queue,
+            "recent_done": recent_done,
+            "recent_failed": recent_failed,
+            "unopened": unopened,
+            "crawl": CRAWL.snapshot(),
+        }
+
+
+FL = FileDownloader()
+
+
+class CrawlState:
+    """
+    Автоматический обход папок. Сам сервер в браузер не ходит: обход выполняет окно приложения
+    (app/main.py) — открывает папки Диска во вкладке и прокручивает их, а перехват забирает списки
+    файлов как при ручном просмотре. Здесь только флаг «обходить» и учёт пройденных папок.
+    """
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.run = False
+        self.current = None
+        self.message = ""
+        self.agent_seen = 0.0     # time.monotonic() последнего опроса от окна приложения
+        self.visited = 0          # папок пройдено с момента запуска обхода
+        self.current_since = None  # когда начали текущую папку: её «свежие» файлы — с updated_at не раньше
+
+    def agent_alive(self):
+        return self.agent_seen and time.monotonic() - self.agent_seen < FL_CRAWL_AGENT_TIMEOUT
+
+    def snapshot(self):
+        with self.lock:
+            return {"run": self.run, "current": self.current, "message": self.message,
+                    "agent": bool(self.agent_alive()), "visited": self.visited}
+
+    def set_run(self, run, message=None, reset=False):
+        if reset:
+            with dbc() as c:
+                c.execute("UPDATE files SET crawled_at=NULL WHERE kind='dir'")
+        with self.lock:
+            if run and not self.run:
+                self.visited = 0
+            self.run = bool(run)
+            if not self.run:
+                self.current = None
+            if message is not None:
+                self.message = message
+            elif run:
+                self.message = ""
+
+    def next_folder(self):
+        """Следующая непройденная папка (сначала верхние уровни). Ни одной папки ещё нет — корень /disk."""
+        with dbc() as c:
+            row = c.execute(
+                "SELECT path FROM files WHERE kind='dir' AND crawled_at IS NULL "
+                "ORDER BY length(path) - length(replace(path, '/', '')), path LIMIT 1").fetchone()
+            path = row[0] if row else None
+            if path is None and not c.execute("SELECT 1 FROM files WHERE path='/disk'").fetchone():
+                path = "/disk"
+        with self.lock:
+            self.current = path
+            self.current_since = now_iso() if path else None
+            return path, self.current_since
+
+    def folder_done(self, path):
+        ts = now_iso()
+        with dbc() as c:
+            c.execute("INSERT INTO files(path, parent, name, kind, first_seen, updated_at, crawled_at) "
+                      "VALUES(?,?,?,'dir',?,?,?) ON CONFLICT(path) DO UPDATE SET crawled_at=excluded.crawled_at",
+                      (path, parent_of(path), FILES_SUBDIR if path == "/disk" else name_from_path(path), ts, ts, ts))
+        with self.lock:
+            self.visited += 1
+            if self.current == path:
+                self.current = None
+
+
+CRAWL = CrawlState()
+
+
 def cleanup_part_files():
     for root, _dirs, files in os.walk(files_dir()):
         for f in files:
@@ -2275,6 +2942,79 @@ def api_vd_retry_failed():
     return jsonify(ok=True, reset=VD.retry_failed())
 
 
+@app.get("/api/fl/status")
+def api_fl_status():
+    return jsonify(FL.snapshot())
+
+
+@app.post("/api/fl/start")
+def api_fl_start():
+    res = FL.start()
+    return jsonify(res), (200 if res.get("ok") else 409)
+
+
+@app.post("/api/fl/stop")
+def api_fl_stop():
+    FL.stop()
+    return jsonify(ok=True, state=FL.state())
+
+
+@app.post("/api/fl/settings")
+def api_fl_settings():
+    settings, errors = FL.update_settings(request.get_json(silent=True) or {})
+    return jsonify(ok=not errors, settings=settings, invalid=errors)
+
+
+@app.post("/api/fl/retry-failed")
+def api_fl_retry_failed():
+    return jsonify(ok=True, reset=FL.retry_failed())
+
+
+@app.get("/api/fl/crawl")
+def api_fl_crawl_get():
+    # ?agent=1 — опрос от окна приложения: так страница статуса знает, что обход есть кому выполнять
+    if request.args.get("agent"):
+        with CRAWL.lock:
+            CRAWL.agent_seen = time.monotonic()
+    return jsonify(CRAWL.snapshot())
+
+
+@app.post("/api/fl/crawl")
+def api_fl_crawl_set():
+    body = request.get_json(silent=True) or {}
+    message = body.get("message")
+    CRAWL.set_run(bool(body.get("run")), message=message if isinstance(message, str) else None,
+                  reset=bool(body.get("reset")))
+    return jsonify(ok=True, crawl=CRAWL.snapshot())
+
+
+@app.post("/api/fl/next-folder")
+def api_fl_next_folder():
+    path, since = CRAWL.next_folder()
+    return jsonify(path=path, since=since)
+
+
+@app.get("/api/fl/folder")
+def api_fl_folder():
+    """children — всего известно содержимого папки; fresh — сколько из него пришло начиная с since
+    (обход по нему понимает, что прокрутка ещё подгружает новые порции)."""
+    path = request.args.get("path") or ""
+    since = request.args.get("since") or ""
+    with dbc() as c:
+        n, fresh = c.execute("SELECT COUNT(*), COALESCE(SUM(updated_at >= ?),0) FROM files WHERE parent=?",
+                             (since, path)).fetchone()
+    return jsonify(path=path, children=n, fresh=fresh)
+
+
+@app.post("/api/fl/folder-done")
+def api_fl_folder_done():
+    path = (request.get_json(silent=True) or {}).get("path")
+    if not isinstance(path, str) or not (path == "/disk" or path.startswith("/disk/")):
+        return jsonify(ok=False, error="path должен начинаться с /disk"), 400
+    CRAWL.folder_done(path)
+    return jsonify(ok=True)
+
+
 STATUS_HTML = r"""<!doctype html>
 <html lang="ru">
 <head>
@@ -2344,7 +3084,7 @@ STATUS_HTML = r"""<!doctype html>
     <h1>Статус загрузки</h1>
     <nav><a href="/">Галерея</a><a href="/status" class="on">Статус загрузки</a></nav>
   </header>
-  <div class="tabs"><button id="tabPhoto" class="tab on">Фото</button><button id="tabVideo" class="tab">Видео</button></div>
+  <div class="tabs"><button id="tabPhoto" class="tab on">Фото</button><button id="tabVideo" class="tab">Видео</button><button id="tabFiles" class="tab">Файлы</button></div>
 
 <!-- ============================== ФОТО ============================== -->
 <div id="photo">
@@ -2359,7 +3099,7 @@ STATUS_HTML = r"""<!doctype html>
   </div>
   <div class="mut" id="dir"></div>
   <div class="controls" style="margin-top:4px">
-    <span class="mut">папка для файлов (общая для фото и видео):</span>
+    <span class="mut">папка для файлов (общая для фото, видео и файлов):</span>
     <input id="dirInput" type="text" style="min-width:320px" placeholder="например, D:\\YandexPhotos или /mnt/data/photos">
     <button id="btnDirApply">Сменить</button>
   </div>
@@ -2438,6 +3178,58 @@ STATUS_HTML = r"""<!doctype html>
   <h3>Ошибки <small id="vFailCount"></small></h3>
   <table id="vFailed"></table>
 </div>
+
+<!-- ============================== ФАЙЛЫ ============================== -->
+<div id="files" hidden>
+  <div class="controls">
+    <span id="fstate" class="pill">…</span>
+    <button id="fStart" class="primary">Скачать файлы</button>
+    <button id="fStop">Остановить</button>
+    <span class="mut">потоков:</span>
+    <input id="fThreads" type="number" min="1" max="8" value="3">
+    <button id="fThreadsApply">Применить</button>
+    <button id="fRetry">Повторить ошибки</button>
+  </div>
+  <label class="mut"><input id="fMedia" type="checkbox"> качать и фото/видео из папок (обычно их качают вкладки «Фото» и «Видео»)</label>
+  <div class="mut" id="fAuth"></div>
+  <div class="mut" id="fDir"></div>
+  <div class="msg" id="fMsg" hidden></div>
+
+  <h3>Откуда берётся список файлов</h3>
+  <div class="mut">Открой во вкладке браузера раздел «Файлы» на Диске и заходи в папки, прокручивая каждую до конца, —
+    перехват запомнит, что в них лежит. Или запусти обход: приложение само откроет все папки по очереди в отдельной вкладке «Обход».</div>
+  <div class="controls">
+    <span id="cstate" class="pill">…</span>
+    <button id="cStart">Обойти все папки</button>
+    <button id="cStop">Остановить обход</button>
+    <button id="cReset">Обойти заново</button>
+  </div>
+  <div class="mut" id="cInfo"></div>
+
+  <div class="cards" id="fCards"></div>
+  <div class="bar"><i id="fBar"></i></div>
+  <div class="mut" id="fBarText" style="margin-top:4px"></div>
+
+  <h3>Качается сейчас <small id="fActiveCount"></small></h3>
+  <table id="fActive"></table>
+
+  <div class="cols">
+    <div>
+      <h3>В ожидании <small id="fQueueCount"></small></h3>
+      <div class="box mono" id="fQueue"></div>
+    </div>
+    <div>
+      <h3>Недавно скачано</h3>
+      <table id="fDone"></table>
+    </div>
+  </div>
+
+  <h3>Ошибки <small id="fFailCount"></small></h3>
+  <table id="fFailed"></table>
+
+  <h3>Папки, которые ещё не открывались <small id="fUnopenedCount"></small></h3>
+  <div class="box mono" id="fUnopened"></div>
+</div>
 </main>
 
 <script>
@@ -2469,16 +3261,18 @@ STATUS_HTML = r"""<!doctype html>
   }
 
   // ---------------- вкладки
-  let tab = location.hash === '#video' ? 'video' : 'photo';
+  let tab = { '#video': 'video', '#files': 'files' }[location.hash] || 'photo';
   function showTab(t) {
     tab = t;
-    $('photo').hidden = t !== 'photo'; $('video').hidden = t !== 'video';
+    $('photo').hidden = t !== 'photo'; $('video').hidden = t !== 'video'; $('files').hidden = t !== 'files';
     $('tabPhoto').classList.toggle('on', t === 'photo'); $('tabVideo').classList.toggle('on', t === 'video');
-    history.replaceState(null, '', t === 'video' ? '#video' : '#photo');
+    $('tabFiles').classList.toggle('on', t === 'files');
+    history.replaceState(null, '', '#' + t);
     refresh();
   }
   $('tabPhoto').onclick = () => showTab('photo');
   $('tabVideo').onclick = () => showTab('video');
+  $('tabFiles').onclick = () => showTab('files');
 
   // ---------------- фото
   function render(s) {
@@ -2644,12 +3438,85 @@ STATUS_HTML = r"""<!doctype html>
     $('vFailed').replaceChildren(...s.recent_failed.map(f => row(el('span', 'mono', f.name), el('span', 'err', f.error || ''), fmtTime(f.at))));
   }
 
+  // ---------------- файлы
+  let fThreadsDirty = false;
+  $('fThreads').addEventListener('input', () => { fThreadsDirty = true; });
+
+  function renderF(s) {
+    const c = s.counts, cr = s.crawl;
+    $('fstate').textContent = { idle: 'остановлено', running: 'идёт загрузка', stopping: 'останавливаюсь…' }[s.state] || s.state;
+    $('fstate').className = 'pill ' + s.state;
+    $('fStart').disabled = s.state !== 'idle';
+    $('fStop').disabled = s.state !== 'running';
+    $('fRetry').disabled = c.failed === 0 || s.state !== 'idle';
+    $('fRetry').textContent = 'Повторить ошибки' + (c.failed ? ` (${c.failed})` : '');
+    $('fThreads').max = s.max_threads;
+    if (!fThreadsDirty && document.activeElement !== $('fThreads')) $('fThreads').value = s.threads;
+    $('fMedia').checked = s.include_media;
+    $('fDir').textContent = 'Папка: ' + s.files_dir + '/<путь на Диске>/';
+    const a = s.auth;
+    if (a.cookies && a.has_sk) {
+      $('fAuth').textContent = `Авторизация: кук ${a.cookies}, sk есть` + (a.has_session ? '' : ', но нет Session_id') +
+        (a.age_sec !== null ? `, обновлена ${a.age_sec < 90 ? a.age_sec + ' с' : Math.round(a.age_sec / 60) + ' мин'} назад` : '');
+      $('fAuth').className = 'mut';
+    } else {
+      $('fAuth').textContent = 'Авторизации нет: открой Яндекс Диск во вкладке браузера — перехват передаст куки и sk.';
+      $('fAuth').className = 'warn';
+    }
+    $('fMsg').hidden = !s.message; $('fMsg').textContent = s.message || '';
+
+    $('cstate').textContent = cr.run ? (cr.agent ? 'обход идёт' : 'обход ждёт окно приложения') : 'обход остановлен';
+    $('cstate').className = 'pill ' + (cr.run ? (cr.agent ? 'running' : 'stopping') : 'idle');
+    $('cStart').disabled = cr.run;
+    $('cStop').disabled = !cr.run;
+    $('cReset').disabled = cr.run || !c.dirs_crawled;
+    $('cInfo').textContent = `Папок пройдено обходом: ${c.dirs_crawled} из ${c.dirs}` +
+      (cr.run ? ` (за этот запуск: ${cr.visited})` : '') + (cr.current ? ` · сейчас: ${cr.current}` : '') +
+      (cr.message ? ' · ' + cr.message : '') +
+      (cr.agent ? '' : ' · Обход выполняет только окно приложения YandexDL Desktop; без него открывай папки сам.');
+
+    const cards = [
+      [fmtBytes(s.speed) + '/с', 'скорость'],
+      [c.done, 'скачано (' + fmtBytes(c.done_bytes) + ')'],
+      [c.remaining, 'ещё не в очереди (' + fmtBytes(c.remaining_bytes) + ')'],
+      [c.queued + ' / ' + s.queue_size, 'в ожидании'],
+      [c.downloading + ' / ' + s.threads, 'качается'],
+      [c.failed, 'ошибок'],
+      [c.files, 'файлов найдено'],
+      [c.media, s.include_media ? 'из них фото/видео' : 'фото/видео пропущено'],
+      [c.dirs, 'папок найдено'],
+    ];
+    $('fCards').replaceChildren(...cards.map(([v, l]) => { const d = el('div', 'card'); d.append(el('b', null, v), el('span', null, l)); return d; }));
+    const total = c.done + c.failed + c.remaining + c.queued + c.downloading;
+    $('fBar').style.width = total ? (100 * c.done / total).toFixed(1) + '%' : '0';
+    $('fBarText').textContent = total ? `${c.done} из ${total} файлов (ошибок: ${c.failed})`
+      : 'Пока нет файлов для скачивания — открой папки в разделе «Файлы» на Диске или запусти обход.';
+
+    $('fActiveCount').textContent = s.active.length ? `(${s.active.length})` : '';
+    $('fActive').replaceChildren(...s.active.map(p => {
+      const pct = p.total ? Math.min(100, 100 * p.bytes / p.total) : 0;
+      const bar = el('div', 'bar'); const i = el('i'); i.style.width = pct + '%'; bar.appendChild(i);
+      return row(el('span', 'mono', p.path), `${p.attempt}/${p.of}`, bar,
+                 fmtBytes(p.bytes) + (p.total ? ' / ' + fmtBytes(p.total) : ''), p.elapsed + ' с');
+    }));
+    $('fQueueCount').textContent = `(${s.queue.length} из ${s.queue_size})`;
+    $('fQueue').replaceChildren(...s.queue.map(n => el('div', null, n)));
+    $('fDone').replaceChildren(...s.recent_done.map(d => row(el('span', 'mono', d.path), fmtBytes(d.bytes),
+      el('span', 'mut', d.note ? 'уже был на диске' : ''), fmtTime(d.at))));
+    $('fFailCount').textContent = c.failed ? `(${c.failed})` : '';
+    $('fFailed').replaceChildren(...s.recent_failed.map(f => row(el('span', 'mono', f.path), el('span', 'err', f.error || ''), fmtTime(f.at))));
+    $('fUnopenedCount').textContent = c.dirs_unopened ? `(${c.dirs_unopened})` : '';
+    $('fUnopened').replaceChildren(...(s.unopened.length ? s.unopened.map(n => el('div', null, n))
+      : [el('div', 'mut', 'нет — содержимое всех найденных папок уже приходило')]));
+  }
+
   let busy = false;
   async function refresh() {
     if (busy) return; busy = true;
     try {
       if (tab === 'photo') render(await api('/api/dl/status'));
-      else renderV(await api('/api/vd/status'));
+      else if (tab === 'video') renderV(await api('/api/vd/status'));
+      else renderF(await api('/api/fl/status'));
     } catch (e) { /* сервер перезапускается */ }
     busy = false;
   }
@@ -2677,6 +3544,18 @@ STATUS_HTML = r"""<!doctype html>
     refresh();
   }
   $('vApply').onclick = applyV;
+
+  $('fStart').onclick = async () => { const r = await api('/api/fl/start', {}); if (r.error) alert(r.error); refresh(); };
+  $('fStop').onclick = async () => { await api('/api/fl/stop', {}); refresh(); };
+  $('fRetry').onclick = async () => { await api('/api/fl/retry-failed', {}); refresh(); };
+  $('fThreadsApply').onclick = async () => {
+    await api('/api/fl/settings', { threads: parseInt($('fThreads').value, 10) });
+    fThreadsDirty = false; $('fThreads').blur(); refresh();
+  };
+  $('fMedia').onchange = async () => { await api('/api/fl/settings', { include_media: $('fMedia').checked }); refresh(); };
+  $('cStart').onclick = async () => { await api('/api/fl/crawl', { run: true }); refresh(); };
+  $('cStop').onclick = async () => { await api('/api/fl/crawl', { run: false, message: 'остановлен вручную' }); refresh(); };
+  $('cReset').onclick = async () => { await api('/api/fl/crawl', { run: true, reset: true }); refresh(); };
 
   showTab(tab); setInterval(refresh, 1000);
 </script>
@@ -2844,10 +3723,12 @@ if __name__ == "__main__":
     load_files_dir_setting()
     os.makedirs(files_dir(), exist_ok=True)
     os.makedirs(THUMBS_DIR, exist_ok=True)
-    print(f"Проверяю существующие файлы: {reconcile_existing_downloads()}")
+    print(f"Проверяю существующие файлы: {reconcile_existing_downloads()}, "
+          f"из раздела «Файлы» уже на диске: {reconcile_existing_files()}")
     cleanup_part_files()
     DL.load_settings()
     VD.load_settings()
+    FL.load_settings()
     print(f"DB: {DB_PATH}\nАвторизация: {AUTH_DB_PATH}")
     print(f"Файлы: {files_dir()}\nПревью: {THUMBS_DIR}" + ("" if HAVE_PIL else "  (!) нет Pillow: pip install pillow"))
     if not shutil.which("ffmpeg"):

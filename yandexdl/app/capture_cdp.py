@@ -12,6 +12,11 @@
 capture/addon.py — меняется только источник событий. Сервер (server/server.py,
 эндпоинты /api/ingest и /api/auth) не меняется вообще.
 
+Раздел «Файлы»: кроме ленты «Фото», из ВСЕХ ответов /models* (старый /models/?_m=…
+и /models-v2?m=…) и из HTML страниц Диска (там бывает вшит список открытой папки)
+вытаскиваются ресурсы /disk/… — файлы и папки — и уходят на /api/ingest-files.
+Имя модели списка папок не важно: ищем сами ресурсы по форме (path/id + type/meta).
+
 ВАЖНО (ограничения прототипа, не проверено на реальном трафике):
   - Нужны события Network.requestWillBeSentExtraInfo / Network.responseReceivedExtraInfo —
     они дают "сырые" заголовки (Cookie, Set-Cookie), которые CDP по умолчанию прячет
@@ -23,6 +28,8 @@ capture/addon.py — меняется только источник событи
     (Target.setDiscoverTargets + Target.targetCreated) на отдельном browser-level
     websocket-соединении — но это заметно больше кода ради экономии 1-2 секунд.
 """
+import base64
+import html
 import json
 import os
 import re
@@ -35,13 +42,16 @@ import websocket  # pip install websocket-client
 
 SERVER_URL = os.environ.get("YDISK_SERVER_URL", "http://127.0.0.1:8001/api/ingest")
 AUTH_URL = os.environ.get("YDISK_AUTH_URL", SERVER_URL.rsplit("/api/", 1)[0] + "/api/auth")
+FILES_URL = os.environ.get("YDISK_FILES_URL", SERVER_URL.rsplit("/api/", 1)[0] + "/api/ingest-files")
 
 TARGET_MODEL = "photo-get-clusters-with-resources"
 TARGET_HOST_HINT = "disk.yandex"
+MODELS_PATH_PREFIX = "/models"   # и /models/?_m=…, и /models-v2?m=…
 YANDEX_BASES = ("yandex.ru", "yandex.com", "ya.ru", "yandex.net")
 
 SK_RE = re.compile(r'"sk"\s*:\s*"([^"]+)"')
 CID_RE = re.compile(r'"connection_id"\s*:\s*"([^"]+)"')
+JSON_SCRIPT_RE = re.compile(r'<script[^>]*type=["\']application/json["\'][^>]*>(.*?)</script>', re.S | re.I)
 
 MAX_BUFFERED_REQUESTS = 800  # на одну вкладку
 
@@ -67,6 +77,42 @@ def find_payload(obj):
             if r is not None:
                 return r
     return None
+
+
+def is_models_url(url: str) -> bool:
+    return urlparse(url).path.startswith(MODELS_PATH_PREFIX)
+
+
+def find_disk_resources(obj, out=None):
+    """Все ресурсы /disk/… (файлы и папки) в любом JSON — так выглядят списки папок раздела «Файлы»."""
+    if out is None:
+        out = []
+    if isinstance(obj, dict):
+        path = obj.get("path") or obj.get("id")
+        if (isinstance(path, str) and (path == "/disk" or path.startswith("/disk/"))
+                and (obj.get("type") in ("file", "dir") or isinstance(obj.get("meta"), dict))):
+            out.append(obj)
+            return out
+        for v in obj.values():
+            find_disk_resources(v, out)
+    elif isinstance(obj, list):
+        for v in obj:
+            find_disk_resources(v, out)
+    return out
+
+
+def resources_from_html(text: str):
+    """Ресурсы из <script type="application/json"> страницы Диска (состояние, вшитое при загрузке)."""
+    out = []
+    for block in JSON_SCRIPT_RE.findall(text or ""):
+        for candidate in (block, html.unescape(block)):
+            try:
+                data = json.loads(candidate)
+            except ValueError:
+                continue
+            find_disk_resources(data, out)
+            break
+    return out
 
 
 def _headers_get(headers: dict, name: str):
@@ -166,12 +212,13 @@ def _post_json(url: str, payload: dict, timeout=20):
 class _TabWatcher(threading.Thread):
     """Слушает CDP-события одной конкретной вкладки (одно websocket-соединение)."""
 
-    def __init__(self, target_id, ws_url, on_log, on_count):
+    def __init__(self, target_id, ws_url, on_log, on_count, on_files):
         super().__init__(daemon=True)
         self.target_id = target_id
         self.ws_url = ws_url
         self.on_log = on_log
         self.on_count = on_count  # on_count(n_clusters, n_resources)
+        self.on_files = on_files  # on_files(n_resources) — ресурсы из списков папок
         self._ws = None
         self._send_lock = threading.Lock()
         self._next_id = 1
@@ -275,7 +322,7 @@ class _TabWatcher(threading.Thread):
         request_id = params.get("requestId")
         req = params.get("request", {})
         url = req.get("url", "")
-        if "/models-v2" not in url:
+        if not is_models_url(url):
             return
         host = urlparse(url).hostname
         if not is_yandex_host(host):
@@ -348,8 +395,14 @@ class _TabWatcher(threading.Thread):
         status = resp.get("status")
         if status == 403:
             self.on_log("[cdp] ⚠️ HTTP 403 — сессия/sk протухли, обнови страницу Диска")
-        if TARGET_MODEL in url and status == 200:
-            e["fetch_body"] = True
+        if status != 200:
+            return
+        if TARGET_MODEL in url:
+            e["fetch_body"] = "photo"
+        elif is_models_url(url):
+            e["fetch_body"] = "files"
+        elif params.get("type") == "Document" and TARGET_HOST_HINT in host:
+            e["fetch_body"] = "html"
 
     def _on_response_extra(self, params):
         request_id = params.get("requestId")
@@ -382,20 +435,31 @@ class _TabWatcher(threading.Thread):
         if not e or not e.get("fetch_body"):
             self._req.pop(request_id, None)
             return
+        mode = e["fetch_body"]
         e["fetch_body"] = False
-        threading.Thread(target=self._fetch_and_ingest, args=(request_id,), daemon=True).start()
+        threading.Thread(target=self._fetch_and_ingest, args=(request_id, mode), daemon=True).start()
 
-    def _fetch_and_ingest(self, request_id):
+    def _fetch_and_ingest(self, request_id, mode):
         result = self._send("Network.getResponseBody", {"requestId": request_id}, wait=True)
         self._req.pop(request_id, None)
         if not result or "body" not in result:
-            self.on_log(f"[cdp] не удалось получить тело ответа ({request_id})")
+            if mode == "photo":
+                self.on_log(f"[cdp] не удалось получить тело ответа ({request_id})")
             return
         text = result["body"]
+        if result.get("base64Encoded"):
+            text = base64.b64decode(text).decode("utf-8", "replace")
+        if mode == "html":
+            self._ingest_files(resources_from_html(text))
+            return
         try:
             data = json.loads(text)
         except ValueError as e:
-            self.on_log(f"[cdp] ответ не JSON: {e}")
+            if mode == "photo":
+                self.on_log(f"[cdp] ответ не JSON: {e}")
+            return
+        if mode == "files":
+            self._ingest_files(find_disk_resources(data))
             return
         payload = find_payload(data)
         if payload is None:
@@ -409,6 +473,19 @@ class _TabWatcher(threading.Thread):
             _post_json(SERVER_URL, payload)
         except Exception as e:  # noqa: BLE001
             self.on_log(f"[cdp] не удалось отправить на сервер: {e}")
+
+    # ---------- списки папок (раздел «Файлы») -> /api/ingest-files
+
+    def _ingest_files(self, resources):
+        if not resources:
+            return
+        n_dirs = sum(1 for r in resources if r.get("type") == "dir")
+        self.on_log(f"[cdp] перехвачен список папки: файлов={len(resources) - n_dirs}, папок={n_dirs}")
+        self.on_files(len(resources))
+        try:
+            _post_json(FILES_URL, {"resources": resources}, timeout=60)
+        except Exception as e:  # noqa: BLE001
+            self.on_log(f"[cdp] не удалось отправить список файлов на сервер: {e}")
 
 
 class CDPCapture:
@@ -426,7 +503,7 @@ class CDPCapture:
         self._stop = threading.Event()
         self._watchers = {}  # target_id -> _TabWatcher
         self._lock = threading.Lock()
-        self._totals = {"clusters": 0, "resources": 0}
+        self._totals = {"clusters": 0, "resources": 0, "files": 0}
 
     def start(self):
         threading.Thread(target=self._poll_loop, daemon=True).start()
@@ -460,7 +537,8 @@ class CDPCapture:
                 existing = self._watchers.get(tid)
                 if existing and existing.is_alive():
                     continue
-                w = _TabWatcher(tid, t["webSocketDebuggerUrl"], on_log=self.on_log, on_count=self._on_count)
+                w = _TabWatcher(tid, t["webSocketDebuggerUrl"], on_log=self.on_log, on_count=self._on_count,
+                                on_files=self._on_files)
                 self._watchers[tid] = w
             w.start()
             self.on_log(f"[cdp] новая вкладка с Диском: {t.get('url')}")
@@ -477,3 +555,7 @@ class CDPCapture:
         self._totals["clusters"] += n_clusters
         self._totals["resources"] += n_resources
         self.on_stats(total_clusters=self._totals["clusters"], total_resources=self._totals["resources"])
+
+    def _on_files(self, n_resources):
+        self._totals["files"] += n_resources
+        self.on_stats(total_files=self._totals["files"])
