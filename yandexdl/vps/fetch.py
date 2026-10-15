@@ -1,8 +1,10 @@
 """
 Скачать одну папку Диска через API работающей программы (127.0.0.1:8001), без окна:
 выбрать папку → включить «качать и фото/видео из папок» → обход → скачивание → отчёт.
+С --rclone скачанное частями переносится в облако, если всё сразу на сервер не помещается.
 
-    python fetch.py --folder Творчество --dest /root/yandex [--dump-dir DIR]
+    python fetch.py --folder Творчество --dest /root/yandex [--dump-dir DIR] [--threads N]
+                    [--no-crawl] [--rclone gdrive:Яндекс [--reserve-gb 2] [--part-gb 5]]
     python fetch.py --status
 
 Только stdlib. Запускает yandexdl-vps.sh fetch / status.
@@ -11,6 +13,7 @@ import argparse
 import json
 import os
 import shutil
+import subprocess
 import sys
 import time
 import urllib.error
@@ -18,6 +21,7 @@ import urllib.request
 
 API = os.environ.get("YDISK_API", "http://127.0.0.1:8001")
 FILES_SUBDIR = "Диск"
+GB = 1024 ** 3
 _OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
@@ -92,18 +96,30 @@ def crawl():
                 f"сейчас: {cr['current'] or '—'}")
 
 
-def download_round():
+def start_download():
     res = api("/api/fl/start", {}, ok_codes=(200, 409))
     if not res.get("ok") and "уже запущено" not in (res.get("error") or ""):
         raise Fail(f"скачивание не запустилось: {res.get('error')}")
+
+
+def download_round(mover=None):
+    start_download()
     last_print = 0
     while True:
         time.sleep(5)
         st = api("/api/fl/status")
-        c, s = st["counts"], st["session"]
+        c = st["counts"]
         if st["state"] == "idle":
             log(f"скачивание остановилось: {st.get('message') or '—'}")
             return st
+        why = mover.need(st) if mover else None
+        if why:
+            log(f"пауза: {why} — переношу скачанное в {mover.target(st)}")
+            api("/api/fl/stop", {})
+            wait_idle(600)
+            mover.move(api("/api/fl/status"))
+            start_download()
+            continue
         if time.time() - last_print > 30:
             last_print = time.time()
             eta = ""
@@ -112,6 +128,13 @@ def download_round():
             log(f"скачано {c['done']} ({human(c['done_bytes'])}), ошибок {c['failed']}, "
                 f"осталось {c['remaining'] + c['queued'] + c['downloading']} ({human(c['remaining_bytes'])}), "
                 f"скорость {human(st['speed'])}/с{eta}")
+
+
+def free_bytes(path):
+    """Свободное место на диске, где лежит path (самой папки может ещё не быть)."""
+    while not os.path.isdir(path) and os.path.dirname(path) != path:
+        path = os.path.dirname(path)
+    return shutil.disk_usage(path).free
 
 
 def local_folder(st):
@@ -133,7 +156,75 @@ def du(path):
     return n, size
 
 
-def report(st):
+class Mover:
+    """
+    Перенос скачанного на облако через rclone move — частями: загрузка встаёт на паузу, когда на сервере
+    остаётся меньше reserve свободного места (или скачана часть в part байт), скачанное уезжает в облако,
+    загрузка продолжается. Перенесённые файлы программа не качает повторно: в её базе они уже done.
+    """
+
+    def __init__(self, remote, reserve_gb, part_gb):
+        self.remote = remote
+        self.reserve = int(reserve_gb * GB)
+        self.part = int(part_gb * GB) if part_gb else None
+        self.mark = None      # done_bytes на момент последнего переноса
+        self.moved = 0        # сколько раз переносили
+
+    def check(self):
+        if ":" not in self.remote:
+            raise Fail("облако указывается как имя:папка, например gdrive:Яндекс")
+        if not shutil.which("rclone"):
+            raise Fail("не установлен rclone: curl https://rclone.org/install.sh | bash")
+        name = self.remote.split(":", 1)[0] + ":"
+        have = subprocess.run(["rclone", "listremotes"], capture_output=True, text=True).stdout.split()
+        if name not in have:
+            raise Fail(f"в rclone нет облака {name} (есть: {', '.join(have) or 'никаких'}) — настрой его: rclone config")
+
+    def target(self, st):
+        rel = os.path.relpath(local_folder(st), st["files_dir"]).replace(os.sep, "/")
+        base = self.remote if self.remote.endswith(":") else self.remote.rstrip("/") + "/"
+        return base + ("" if rel == "." else rel)
+
+    def need(self, st):
+        done = st["counts"]["done_bytes"]
+        if self.mark is None:
+            self.mark = done
+        free = free_bytes(st["files_dir"])
+        if free < self.reserve:
+            return f"на сервере осталось {human(free)}"
+        if self.part and done - self.mark >= self.part:
+            return f"скачана очередная часть ({human(done - self.mark)})"
+        return None
+
+    def move(self, st):
+        src = local_folder(st)
+        n, size = du(src) if os.path.isdir(src) else (0, 0)
+        if n:
+            dst = self.target(st)
+            log(f"rclone: переношу {n} файлов ({human(size)}) в {dst}")
+            r = subprocess.run(["rclone", "move", src, dst, "--delete-empty-src-dirs", "--exclude", "*.part",
+                                "--transfers", "4", "--stats", "60s", "--stats-one-line",
+                                "--stats-log-level", "NOTICE"])
+            left, _ = du(src) if os.path.isdir(src) else (0, 0)
+            if r.returncode != 0 or left:
+                raise Fail(f"rclone перенёс не всё (код {r.returncode}, на сервере осталось {left} файлов) — "
+                           "смотри его сообщения выше; потом повтори fetch с --no-crawl")
+            self.moved += 1
+            log(f"rclone: перенесено, файлов {n}, {human(size)}")
+        self.mark = st["counts"]["done_bytes"]
+        free = free_bytes(st["files_dir"])
+        if free < self.reserve:
+            raise Fail(f"после переноса на сервере свободно только {human(free)} — освободи место и повтори")
+
+    def remote_size(self, st):
+        r = subprocess.run(["rclone", "size", self.target(st), "--json"], capture_output=True, text=True)
+        try:
+            return json.loads(r.stdout)
+        except ValueError:
+            return None
+
+
+def report(st, mover=None):
     c = st["counts"]
     folder = local_folder(st)
     n, size = du(folder)
@@ -145,6 +236,11 @@ def report(st):
     print(f"Ошибок:          {c['failed']}")
     print(f"На диске сервера: {folder}")
     print(f"                 {n} файлов, {human(size)} ({size} байт)")
+    if mover:
+        rs = mover.remote_size(st)
+        print(f"В облаке:        {mover.target(st)}")
+        print(f"                 " + (f"{rs['count']} файлов, {human(rs['bytes'])} ({rs['bytes']} байт)" if rs
+                                      else "не удалось посчитать (rclone size)"))
     if c["failed"]:
         print("Не скачались (последние):")
         for x in st["recent_failed"][:15]:
@@ -152,7 +248,9 @@ def report(st):
     print("=" * 70)
 
 
-def run(folder, dest, dump_dir):
+def run(folder, dest, dump_dir, no_crawl=False, mover=None, threads=None):
+    if mover:
+        mover.check()
     check_auth()
     api("/api/fl/stop", {})
     api("/api/fl/crawl", {"run": False})
@@ -163,16 +261,25 @@ def run(folder, dest, dump_dir):
     sc = api("/api/fl/scope", {"folder": folder}, ok_codes=(200, 400))
     if not sc.get("ok"):
         raise Fail(f"папка на Диске «{folder}»: {sc.get('error')}")
-    api("/api/fl/settings", {"include_media": True})
-    log(f"папка на Диске: {sc['scope']}; качать в {d['dir']}; фото/видео из папок: да")
+    settings = {"include_media": True}
+    if threads:
+        settings["threads"] = threads
+    fs = api("/api/fl/settings", settings)["settings"]
+    log(f"папка на Диске: {sc['scope']}; качать в {d['dir']}; фото/видео из папок: да; потоков: {fs['threads']}"
+        + (f"; переносить в {mover.remote}" if mover else ""))
 
-    msg = crawl()
+    if no_crawl:
+        log("обход пропускаю: беру список файлов, собранный раньше")
+    else:
+        msg = crawl()
+        if msg.startswith("остановлен"):
+            raise Fail("обход прервался: " + msg + "\nВойди заново через «yandexdl vnc» и повтори «yandexdl fetch»")
     st = api("/api/fl/status")
     c = st["counts"]
-    if msg.startswith("остановлен"):
-        raise Fail("обход прервался: " + msg + "\nВойди заново через «yandexdl vnc» и повтори «yandexdl fetch»")
     log(f"найдено файлов {c['files']} (фото/видео {c['media']}), папок {c['dirs']}; "
         f"к скачиванию {c['remaining']} файлов, {human(c['remaining_bytes'])}")
+    if not c["files"] and no_crawl:
+        raise Fail(f"в собранном списке нет файлов в «{sc['scope']}» — проверь название или запусти без --no-crawl")
     if not c["files"]:
         print("\nФайлов не найдено: похоже, Диск отдаёт список папки в непредусмотренном виде.")
         print("Ниже — разбор перехваченных ответов (его и нужно прислать, чтобы поправить find_disk_resources):\n")
@@ -182,21 +289,33 @@ def run(folder, dest, dump_dir):
             diagnose.main([dump_dir])
         return 2
 
-    free = shutil.disk_usage(st["files_dir"] if os.path.isdir(st["files_dir"]) else dest).free
-    if c["remaining_bytes"] > free - 200 * 1024 * 1024:
-        raise Fail(f"не хватит места: нужно {human(c['remaining_bytes'])}, свободно {human(free)}")
+    free = free_bytes(st["files_dir"])
+    if mover:
+        if free < mover.reserve + 500 * 1024 * 1024:
+            raise Fail(f"на сервере свободно {human(free)} — меньше запаса {human(mover.reserve)} + 500 МБ")
+        if c["remaining_bytes"] > free - mover.reserve:
+            log(f"всё сразу не поместится ({human(c['remaining_bytes'])}, свободно {human(free)}) — "
+                f"качаю частями, каждую переношу в облако")
+        mover.move(st)            # то, что уже лежит на сервере от прошлых запусков, — сразу в облако
+    elif c["remaining_bytes"] > free - 200 * 1024 * 1024:
+        raise Fail(f"не хватит места: нужно {human(c['remaining_bytes'])}, свободно {human(free)}. "
+                   "Можно качать частями с переносом в облако: --rclone имя:папка")
 
     for rnd in (1, 2):
-        st = download_round()
+        st = download_round(mover)
         if (st.get("message") or "").startswith("Остановился"):
-            report(st)
+            if mover:
+                mover.move(st)
+            report(st, mover)
             raise Fail("скачивание прервалось из-за входа в Яндекс: войди заново через «yandexdl vnc», "
-                       "открой Диск и повтори «yandexdl fetch» — уже скачанное не перекачается")
+                       "открой Диск и повтори «yandexdl fetch … --no-crawl» — уже скачанное не перекачается")
         if not st["counts"]["failed"] or rnd == 2:
             break
         n = api("/api/fl/retry-failed", {}).get("reset")
         log(f"повторяю {n} файлов с ошибками")
-    report(st)
+    if mover:
+        mover.move(st)
+    report(st, mover)
     return 0 if not st["counts"]["failed"] else 1
 
 
@@ -220,6 +339,11 @@ def main():
     p.add_argument("--dest", default="/root/yandex")
     p.add_argument("--dump-dir")
     p.add_argument("--status", action="store_true")
+    p.add_argument("--no-crawl", action="store_true", help="не обходить папки, взять список, собранный раньше")
+    p.add_argument("--rclone", metavar="ИМЯ:ПАПКА", help="переносить скачанное в облако (rclone move) частями")
+    p.add_argument("--reserve-gb", type=float, default=2.0, help="с --rclone: сколько места оставлять свободным")
+    p.add_argument("--part-gb", type=float, help="с --rclone: переносить каждые столько скачанных ГБ")
+    p.add_argument("--threads", type=int, help="сколько файлов качать одновременно (1–8)")
     a = p.parse_args()
     try:
         if a.status:
@@ -227,7 +351,8 @@ def main():
             return 0
         if not a.folder:
             p.error("--folder обязателен")
-        return run(a.folder, a.dest, a.dump_dir)
+        mover = Mover(a.rclone, a.reserve_gb, a.part_gb) if a.rclone else None
+        return run(a.folder, a.dest, a.dump_dir, no_crawl=a.no_crawl, mover=mover, threads=a.threads)
     except Fail as e:
         print(f"\nОшибка: {e}", flush=True)
         return 3

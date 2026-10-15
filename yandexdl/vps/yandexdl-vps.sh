@@ -5,7 +5,8 @@
 #   bash yandexdl-vps.sh install            поставить всё (Debian/Ubuntu, от root)
 #   bash yandexdl-vps.sh vnc                включить noVNC: ссылка + одноразовый пароль
 #   bash yandexdl-vps.sh vnc-off            выключить noVNC (после входа в Яндекс)
-#   bash yandexdl-vps.sh fetch Творчество   обойти папку и скачать её (в /root/yandex/Диск/…)
+#   bash yandexdl-vps.sh fetch Творчество   обойти папку и скачать её (в /root/yandex/Диск/…);
+#        [--no-crawl] [--rclone gdrive:Папка] [--threads 1]   без обхода; частями в облако; потоки
 #   bash yandexdl-vps.sh status             что сейчас происходит
 #   bash yandexdl-vps.sh diagnose           в каком виде Диск отдаёт списки папок (если файлов 0)
 #   bash yandexdl-vps.sh start|stop|restart|logs
@@ -228,12 +229,17 @@ cmd_vnc_off() {
 
 cmd_fetch() {
   need_root
-  [ $# -ge 1 ] || die "укажи папку: yandexdl fetch Творчество [куда_качать]"
+  [ $# -ge 1 ] || die "укажи папку: yandexdl fetch Творчество [--no-crawl] [--rclone gdrive:Папка] [--threads 1]"
+  local folder=$1; shift
+  if systemctl is-active -q yandexdl-fetch; then
+    die "задание уже идёт (yandexdl status). Остановить его: systemctl stop yandexdl-fetch"
+  fi
   systemctl is-active -q yandexdl-app || cmd_start
   wait_api 60 || die "API программы не отвечает"
   systemctl reset-failed yandexdl-fetch.service 2>/dev/null || true
-  systemd-run -q --unit=yandexdl-fetch --collect \
-    "$VENV/bin/python" -u "$APP_DIR/vps/fetch.py" --folder "$1" --dest "${2:-$DEST_DEFAULT}" --dump-dir "$DUMP_DIR"
+  # HOME — чтобы rclone нашёл свой конфиг (/root/.config/rclone/rclone.conf)
+  systemd-run -q --unit=yandexdl-fetch --collect --setenv=HOME=/root \
+    "$VENV/bin/python" -u "$APP_DIR/vps/fetch.py" --folder "$folder" --dest "$DEST_DEFAULT" --dump-dir "$DUMP_DIR" "$@"
   echo "Обход и скачивание идут в фоне (служба yandexdl-fetch) — можно закрыть SSH, работа не прервётся."
   echo "Ctrl+C только перестаёт показывать ход. Снова посмотреть: yandexdl status"
   echo
@@ -268,5 +274,5 @@ case "${1:-}" in
   status)   cmd_status ;;
   diagnose) cmd_diagnose ;;
   logs)     shift; cmd_logs "$@" ;;
-  *) sed -n '2,11p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 1 ;;
+  *) sed -n '2,12p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac
