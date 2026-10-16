@@ -2355,14 +2355,31 @@ VD = VideoDownloader()
 _WIN_RESERVED = {"CON", "PRN", "AUX", "NUL"} | {f"COM{i}" for i in range(1, 10)} | {f"LPT{i}" for i in range(1, 10)}
 
 
+_NAME_MAX_BYTES = 255     # предел длины имени файла/папки в Linux (ext4) — в байтах UTF-8, а кириллица и иврит по 2 байта
+_NAME_CUT_BYTES = 240     # длинные имена режем до стольких байт: запас под метку _with_tag
+
+
+def _fit_name(s, original):
+    """Слишком длинное имя: укоротить основу, оставив расширение, и добавить ~метку от полного имени (чтобы не совпали)."""
+    if len(s.encode("utf-8")) <= _NAME_MAX_BYTES:
+        return s
+    stem, ext = os.path.splitext(s)
+    if len(ext.encode("utf-8")) > 20:
+        stem, ext = s, ""
+    tag = "~" + hashlib.md5(original.encode("utf-8")).hexdigest()[:8]
+    budget = _NAME_CUT_BYTES - len((tag + ext).encode("utf-8"))
+    return stem.encode("utf-8")[:budget].decode("utf-8", "ignore").rstrip(" .") + tag + ext
+
+
 def _safe_component(part):
-    """Одна часть пути: без запрещённых символов, без «..», без хвостовых точек/пробелов и имён вроде CON (Windows)."""
+    """Одна часть пути: без запрещённых символов, без «..», без хвостовых точек/пробелов и имён вроде CON (Windows),
+    не длиннее, чем позволяет файловая система."""
     s = safe_name(part).rstrip(" .")
     if not s:
         s = "_"
     if s.split(".", 1)[0].upper() in _WIN_RESERVED:
         s = "_" + s
-    return s
+    return _fit_name(s, part)
 
 
 def disk_rel_path(path):
