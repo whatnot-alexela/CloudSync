@@ -203,7 +203,12 @@ EOF
   systemctl enable -q yandexdl-app.service
 
   cmd_start
-  say "Готово. Дальше: yandexdl vnc  — ссылка для входа в Яндекс"
+  # при обновлении вход в Яндекс уже есть: он хранится в профиле браузера в $STATE, установка его не трогает
+  if curl -fsS -m 5 "$API/api/auth/status" 2>/dev/null | grep -q '"has_sk": *true'; then
+    say "Готово. Вход в Яндекс сохранён — можно запускать yandexdl fetch"
+  else
+    say "Готово. Дальше: yandexdl vnc  — ссылка для входа в Яндекс"
+  fi
 }
 
 cmd_update() {
