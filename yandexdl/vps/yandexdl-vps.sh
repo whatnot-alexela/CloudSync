@@ -210,6 +210,12 @@ cmd_update() {
   need_root
   local src
   src=$(source_dir) || die "не знаю, откуда ставилась программа — запусти install из папки с новой версией: bash ПАПКА/yandexdl/vps/yandexdl-vps.sh install"
+  # клон с GitHub — сначала забрать свежий код его ветки
+  if git -C "$src" rev-parse --abbrev-ref --symbolic-full-name '@{u}' >/dev/null 2>&1; then
+    say "Свежий код: git pull в $src"
+    git -C "$src" pull --ff-only \
+      || die "git pull не прошёл (причина выше). Поставить то, что уже лежит в папке: bash $src/vps/yandexdl-vps.sh install"
+  fi
   exec bash "$src/vps/yandexdl-vps.sh" install
 }
 
