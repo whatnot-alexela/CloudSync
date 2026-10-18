@@ -214,7 +214,9 @@ class FolderCrawler(QObject):
     def toggle(self):
         st = self._api("/api/fl/crawl")
         if st is not None:
-            self._api("/api/fl/crawl", {"run": not st.get("run")})
+            # с пометкой «вручную» vps/fetch.py не продолжает обход сам (как после перезапуска программы)
+            self._api("/api/fl/crawl", {"run": False, "message": "остановлен вручную"} if st.get("run")
+                      else {"run": True})
 
     def _finish(self, message):
         self._api("/api/fl/crawl", {"run": False, "message": message})

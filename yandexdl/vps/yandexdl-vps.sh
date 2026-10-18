@@ -8,6 +8,7 @@
 #   bash yandexdl-vps.sh fetch Творчество   обойти папку и скачать её (в /root/yandex/Диск/…); «/» — весь Диск;
 #        [--no-crawl] [--rclone gdrive:Папка] [--threads 1]   без обхода; частями в облако; потоки
 #        [--exclude Папка]…                  кроме этой подпапки (путь от корня Диска, можно несколько раз)
+#        повтор той же команды продолжает с места остановки; [--recrawl] — обойти все папки заново
 #   bash yandexdl-vps.sh pick Папка         оставить в папке только выбранные подпапки и обойти их
 #   bash yandexdl-vps.sh status             что сейчас происходит
 #   bash yandexdl-vps.sh diagnose           в каком виде Диск отдаёт списки папок (если файлов 0)
@@ -231,7 +232,7 @@ cmd_vnc_off() {
 
 cmd_fetch() {
   need_root
-  [ $# -ge 1 ] || die "укажи папку (/ — весь Диск): yandexdl fetch Творчество [--no-crawl] [--rclone gdrive:Папка] [--threads 1] [--exclude Папка]"
+  [ $# -ge 1 ] || die "укажи папку (/ — весь Диск): yandexdl fetch Творчество [--no-crawl|--recrawl] [--rclone gdrive:Папка] [--threads 1] [--exclude Папка]"
   local folder=$1; shift
   if systemctl is-active -q yandexdl-fetch; then
     die "задание уже идёт (yandexdl status). Остановить его: systemctl stop yandexdl-fetch"
@@ -283,5 +284,5 @@ case "${1:-}" in
   pick)     shift; cmd_pick "$@" ;;
   diagnose) cmd_diagnose ;;
   logs)     shift; cmd_logs "$@" ;;
-  *) sed -n '2,14p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 1 ;;
+  *) sed -n '2,15p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac

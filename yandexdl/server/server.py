@@ -23,6 +23,7 @@
 """
 import bisect
 import codecs
+import errno
 import hashlib
 import io
 import json
@@ -227,6 +228,7 @@ FL_SALVAGE_TIMEOUT = 6          # сек на кусок: целые куски 
 FL_SALVAGE_JOBS = 4             # кусков одновременно
 FL_SALVAGE_LINK_REFRESH = 5     # сколько раз за файл можно взять новую ссылку
 FL_SALVAGE_BUDGET = 600         # сек на файл сверх времени при 50 КБ/с; потом недочитанное считается потерянным
+STARTED_AT = time.time()    # запуск программы: по нему vps/fetch.py видит, что её перезапустили (сбой, нехватка памяти)
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 256 * 1024 * 1024
@@ -1393,6 +1395,10 @@ class Aborted(Exception):
 
 class Unreadable(Exception):
     """Файл на Диске не отдаёт ни одного байта — спасать нечего."""
+
+
+class NoSpace(Exception):
+    """На диске, куда качаем, кончилось место — дальше упадёт каждый файл, загрузку надо остановить."""
 
 
 class DeadlineError(Exception):
@@ -2739,6 +2745,7 @@ class FileDownloader:
                            f".{hashlib.md5(path.encode('utf-8')).hexdigest()[:8]}.part")
         size = row.get("size")
         errors = []
+        keep_tmp = False
         try:
             for attempt in range(1, FL_ATTEMPTS + 1):
                 if self.stop_event.is_set():
@@ -2760,6 +2767,8 @@ class FileDownloader:
                     errors.append(f"{attempt}: {e}")
                     break
                 except Exception as e:  # noqa: BLE001
+                    if isinstance(e, OSError) and e.errno == errno.ENOSPC:
+                        raise NoSpace() from e
                     # свои ошибки (VideoError, голый OSError) показываем как есть, без имени класса
                     errors.append(f"{attempt}: {e if isinstance(e, VideoError) or type(e) is OSError else short_err(e)}")
                     if attempt < FL_ATTEMPTS and not size:
@@ -2776,14 +2785,20 @@ class FileDownloader:
                 return
             self._record_fail(path, "; ".join(errors))
         except Aborted:
+            # остановили (например, пауза для переноса в облако) — недокачанное остаётся, _fetch докачает с места
+            keep_tmp = True
             self._set_file(path, None)
         except AuthError as e:
+            keep_tmp = True
             self._set_file(path, None)
             self.stop(f"Остановился: {e}")
+        except NoSpace:
+            self._set_file(path, None)
+            self.stop("Нет места на диске: загрузка остановлена, недокачанные файлы вернулись в очередь")
         finally:
             with self.alock:
                 self.active.pop(path, None)
-            if os.path.exists(tmp):
+            if not keep_tmp and os.path.exists(tmp):
                 try:
                     os.remove(tmp)
                 except OSError:
@@ -2848,13 +2863,18 @@ class FileDownloader:
         или None, если файл в итоге прочитался целиком). Ни одного байта — Unreadable.
         """
         os.makedirs(os.path.dirname(tmp), exist_ok=True)
-        have = min(os.path.getsize(tmp), size) if os.path.exists(tmp) else 0
+        link = {"url": get_download_url(path), "refresh": 0, "dead": False, "http": None}   # до того, как трогать tmp
+        # Обычная загрузка пишет подряд: всё до конца tmp — настоящее начало файла. А tmp полного размера оставило
+        # прошлое спасение, которое сорвалось (оно сразу растягивает файл, непрочитанное — нули): что в нём прочитано,
+        # неизвестно, читаем всё заново — иначе дыры ушли бы в «целый» файл.
+        have = os.path.getsize(tmp) if os.path.exists(tmp) else 0
+        if have >= size:
+            have = 0
         with open(tmp, "ab"):
             pass
         with open(tmp, "r+b") as f:
             f.truncate(size)
         ok = [[0, have]] if have else []
-        link = {"url": get_download_url(path), "refresh": 0, "dead": False, "http": None}
         llock = threading.Lock()
         deadline = time.monotonic() + FL_SALVAGE_BUDGET + size / 50000
         prog.update(bytes=have, total=size, note="файл повреждён — спасаю по кускам")
@@ -3050,6 +3070,7 @@ class FileDownloader:
         return {
             "state": self.state(),
             "message": self.message,
+            "started": STARTED_AT,
             "threads": self.threads,
             "max_threads": FL_MAX_THREADS,
             "include_media": self.include_media,
@@ -3253,7 +3274,9 @@ def api_fl_start():
 
 @app.post("/api/fl/stop")
 def api_fl_stop():
-    FL.stop()
+    # message — почему остановили (кнопка на странице: «вручную»): его покажут статус и отчёт vps/fetch.py
+    message = (request.get_json(silent=True) or {}).get("message")
+    FL.stop(message if isinstance(message, str) else "")
     return jsonify(ok=True, state=FL.state())
 
 
@@ -3895,7 +3918,7 @@ STATUS_HTML = r"""<!doctype html>
   $('vApply').onclick = applyV;
 
   $('fStart').onclick = async () => { const r = await api('/api/fl/start', {}); if (r.error) alert(r.error); refresh(); };
-  $('fStop').onclick = async () => { await api('/api/fl/stop', {}); refresh(); };
+  $('fStop').onclick = async () => { await api('/api/fl/stop', { message: 'Остановлено вручную.' }); refresh(); };
   $('fRetry').onclick = async () => { await api('/api/fl/retry-failed', {}); refresh(); };
   $('fThreadsApply').onclick = async () => {
     await api('/api/fl/settings', { threads: parseInt($('fThreads').value, 10) });
