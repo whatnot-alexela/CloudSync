@@ -3,6 +3,7 @@
 # в Яндекс входишь сам через noVNC в браузере, обход и скачивание — через API программы.
 #
 #   bash yandexdl-vps.sh install            поставить всё (Debian/Ubuntu, от root)
+#   bash yandexdl-vps.sh update             поставить заново после git pull / scp новой версии
 #   bash yandexdl-vps.sh vnc                включить noVNC: ссылка + одноразовый пароль
 #   bash yandexdl-vps.sh vnc-off            выключить noVNC (после входа в Яндекс)
 #   bash yandexdl-vps.sh fetch Творчество   обойти папку и скачать её (в /root/yandex/Диск/…); «/» — весь Диск;
@@ -51,10 +52,34 @@ wait_api() {
   return 1
 }
 
+# Отпечаток кода программы (то, что запускается, и зависимости). Работает копия в $APP_DIR, и git pull или scp
+# новой версии её не меняют: пока не выполнить install, идёт прежний код.
+code_sum() {
+  { (cd "$1" && find app server capture vps -type f \( -name '*.py' -o -name '*.sh' \) -not -path '*/__pycache__/*' \
+      | LC_ALL=C sort | xargs -r -d '\n' sha1sum -- requirements.txt) 2>/dev/null || true; } | sha1sum | cut -c1-10
+}
+
+source_dir() {   # папка с исходниками: откуда запущен этот скрипт или откуда ставили программу в прошлый раз
+  if [ "$SRC_DIR" != "$APP_DIR" ]; then echo "$SRC_DIR"; return 0; fi
+  local src
+  src=$(cat "$BASE/source" 2>/dev/null || true)
+  [ -n "$src" ] && [ -f "$src/app/main.py" ] && echo "$src"
+}
+
+stale_src() {    # папка с исходниками, если код в ней не тот, что установлен
+  local src
+  src=$(source_dir) || return 1
+  [ "$(code_sum "$src")" != "$(code_sum "$APP_DIR")" ] || return 1
+  echo "$src"
+}
+
 cmd_install() {
   need_root
   command -v apt-get >/dev/null || die "скрипт рассчитан на Debian/Ubuntu (apt-get)"
   [ -f "$SRC_DIR/app/main.py" ] || die "не нашёл $SRC_DIR/app/main.py — скрипт должен лежать в yandexdl/vps/"
+  # перезапуск программы оборвал бы задание старой версии; новая продолжит его с того же места
+  systemctl is-active -q yandexdl-fetch 2>/dev/null \
+    && die "идёт задание (yandexdl status). Останови его: systemctl stop yandexdl-fetch — после установки повтори ту же команду fetch, она продолжит"
 
   say "Система"
   . /etc/os-release && echo "ОС: $PRETTY_NAME"
@@ -108,7 +133,15 @@ cmd_install() {
   say "Программа -> $APP_DIR"
   mkdir -p "$APP_DIR" "$STATE" "$DUMP_DIR" "$VNC_DIR"
   chmod 700 "$STATE"
-  rsync -a --delete --exclude '.venv' --exclude '__pycache__' --exclude '*.pyc' "$SRC_DIR/" "$APP_DIR/"
+  if [ "$SRC_DIR" != "$APP_DIR" ]; then
+    rsync -a --delete --exclude '.venv' --exclude '__pycache__' --exclude '*.pyc' "$SRC_DIR/" "$APP_DIR/"
+    # какая версия стоит (её пишут status и лог fetch) и откуда ставили (отсюда берёт update)
+    local ver
+    ver=$(git -C "$SRC_DIR" log -1 --format='коммит %h от %cd' --date=format-local:'%d.%m.%Y %H:%M' 2>/dev/null || true)
+    echo "${ver:-код $(code_sum "$SRC_DIR")}, установлена $(date '+%d.%m.%Y %H:%M')" > "$APP_DIR/VERSION"
+    echo "$SRC_DIR" > "$BASE/source"
+    echo "версия: $(cat "$APP_DIR/VERSION")"
+  fi
   chmod 755 "$APP_DIR/vps/yandexdl-vps.sh"
   ln -sfn "$APP_DIR/vps/yandexdl-vps.sh" /usr/local/bin/yandexdl
 
@@ -173,6 +206,13 @@ EOF
   say "Готово. Дальше: yandexdl vnc  — ссылка для входа в Яндекс"
 }
 
+cmd_update() {
+  need_root
+  local src
+  src=$(source_dir) || die "не знаю, откуда ставилась программа — запусти install из папки с новой версией: bash ПАПКА/yandexdl/vps/yandexdl-vps.sh install"
+  exec bash "$src/vps/yandexdl-vps.sh" install
+}
+
 cmd_start() {
   need_root
   systemctl restart yandexdl-xvfb yandexdl-app
@@ -233,9 +273,12 @@ cmd_vnc_off() {
 cmd_fetch() {
   need_root
   [ $# -ge 1 ] || die "укажи папку (/ — весь Диск): yandexdl fetch Творчество [--no-crawl|--recrawl] [--rclone gdrive:Папка] [--threads 1] [--exclude Папка]"
-  local folder=$1; shift
+  local folder=$1 src; shift
   if systemctl is-active -q yandexdl-fetch; then
     die "задание уже идёт (yandexdl status). Остановить его: systemctl stop yandexdl-fetch"
+  fi
+  if src=$(stale_src); then
+    die "код в $src не совпадает с установленным в $APP_DIR, а работает установленный — после git pull или scp его нужно поставить: yandexdl update (или bash $src/vps/yandexdl-vps.sh install), потом повтори fetch"
   fi
   systemctl is-active -q yandexdl-app || cmd_start
   wait_api 60 || die "API программы не отвечает"
@@ -256,10 +299,17 @@ cmd_fetch() {
 cmd_status() {
   wait_api 3 || die "программа не запущена: yandexdl start"
   "$VENV/bin/python" -u "$APP_DIR/vps/fetch.py" --status
-  if systemctl is-active -q yandexdl-fetch; then
-    echo; echo "Последние строки задания (yandexdl-fetch):"
-    journalctl -u yandexdl-fetch -n 8 -o cat --no-pager
+  local src
+  if src=$(stale_src); then
+    echo "(!) Код в $src не совпадает с установленным, работает установленный — поставь новый: yandexdl update"
   fi
+  echo
+  if systemctl is-active -q yandexdl-fetch; then
+    echo "Задание идёт (yandexdl-fetch), последние строки:"
+  else
+    echo "Задание не идёт. Чем закончился последний запуск fetch:"
+  fi
+  journalctl -u yandexdl-fetch -n 8 -o cat --no-pager -q || true
 }
 
 cmd_pick() {
@@ -274,6 +324,7 @@ cmd_logs() { journalctl -u yandexdl-app -o cat --no-pager -n "${1:-80}" | grep -
 
 case "${1:-}" in
   install)  cmd_install ;;
+  update)   cmd_update ;;
   start)    cmd_start ;;
   stop)     cmd_stop ;;
   restart)  cmd_stop; cmd_start ;;
@@ -284,5 +335,5 @@ case "${1:-}" in
   pick)     shift; cmd_pick "$@" ;;
   diagnose) cmd_diagnose ;;
   logs)     shift; cmd_logs "$@" ;;
-  *) sed -n '2,15p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 1 ;;
+  *) sed -n '2,16p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac

@@ -77,6 +77,15 @@ def log(msg):
     print(time.strftime("%H:%M:%S"), msg, flush=True)
 
 
+def installed_version():
+    """Какая версия программы установлена (yandexdl-vps.sh install пишет её в VERSION): по логу видно, какой код работал."""
+    try:
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, "VERSION"), encoding="utf-8") as f:
+            return f.read().strip() or None
+    except OSError:
+        return None
+
+
 _started = [None]   # время запуска программы, каким его видели в прошлый раз
 
 
@@ -414,6 +423,7 @@ def report(st, mover=None, dmg=(0, 0, 0)):
 
 def run(folder, dest, dump_dir, no_crawl=False, recrawl=False, mover=None, threads=None, retry_failed=False,
         exclude=()):
+    log(f"программа: {installed_version() or 'версия не записана (поставлена старым install)'}")
     if mover:
         mover.check()
     check_auth()
@@ -514,6 +524,7 @@ def status():
     c, cr, a = st["counts"], st["crawl"], st["auth"]
     if st.get("started"):
         print(f"Программа работает с {time.strftime('%d.%m %H:%M', time.localtime(st['started']))}")
+    print(f"Версия: {installed_version() or 'не записана (поставлена старым install)'}")
     print(f"Вход в Яндекс: кук {a['cookies']}, sk {'есть' if a['has_sk'] else 'нет'}, "
           f"Session_id {'есть' if a['has_session'] else 'нет'}")
     print(f"Папка: {st['scope']}{except_text(st)}  →  {local_folder(st)}")
