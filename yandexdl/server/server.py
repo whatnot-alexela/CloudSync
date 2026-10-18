@@ -2485,13 +2485,15 @@ class FileDownloader:
     Ссылку берёт так же, как загрузка видео: models-v2?m=mpfs/url с куками и sk из auth.db.
     Обрыв или просроченная ссылка — новая ссылка и докачка с места обрыва (Range), до FL_ATTEMPTS попыток.
     Фото и видео из папок по умолчанию пропускает (их качают вкладки «Фото» и «Видео»), это настраивается.
-    scope — папка, внутри которой работают загрузка и обход (по умолчанию весь Диск).
+    scope — папка, внутри которой работают загрузка и обход (по умолчанию весь Диск);
+    exclude — её подпапки, которые при этом не обходить, не считать и не качать (статусы их файлов не меняются).
     """
 
     def __init__(self):
         self.threads = FL_DEFAULT_THREADS
         self.include_media = False
         self.scope = "/disk"
+        self.exclude = []
         self.stop_event = threading.Event()
         self.stop_event.set()
         self.finishing = threading.Event()
@@ -2509,7 +2511,8 @@ class FileDownloader:
         self.opener = build_opener()
 
     def scope_sql(self):
-        return subtree_sql(self.scope)
+        parts = [subtree_sql(self.scope)] + [f"NOT {subtree_sql(x)}" for x in self.exclude]
+        return parts[0] if len(parts) == 1 else "(" + " AND ".join(parts) + ")"
 
     def eligible(self):
         return (f"kind='file' AND fl_status IS NULL AND {self.scope_sql()}"
@@ -2525,17 +2528,44 @@ class FileDownloader:
         self.include_media = get_setting("fl_include_media", "0") == "1"
         scope, err = normalize_disk_folder(get_setting("fl_scope", "/disk"))
         self.scope = scope if not err else "/disk"
+        try:
+            self.exclude = [x for x in json.loads(get_setting("fl_exclude", "[]")) if isinstance(x, str)]
+        except (TypeError, ValueError):
+            self.exclude = []
 
-    def set_scope(self, value):
-        """Выбрать папку, внутри которой работают загрузка и обход. Пусто — весь Диск."""
+    def set_scope(self, value, exclude=()):
+        """Выбрать папку, внутри которой работают загрузка и обход (пусто — весь Диск), и её подпапки,
+        которые при этом не трогать (пути как у value). Без exclude прежние исключения снимаются."""
         if self.state() != "idle" or CRAWL.run:
             return None, "сначала останови загрузку файлов и обход, потом меняй папку"
         folder, err = normalize_disk_folder(value)
         if err:
             return None, err
         folder = known_folder_case(folder)
-        self.scope = folder
+        if isinstance(exclude, str):
+            exclude = [exclude]
+        if not isinstance(exclude, (list, tuple)):
+            return None, "exclude — список папок"
+        skip = []
+        for x in exclude or ():
+            sub, err = normalize_disk_folder(x) if isinstance(x, str) else (None, "нужна строка")
+            if err:
+                return None, f"исключение «{x}»: {err}"
+            sub = known_folder_case(sub)
+            if not sub.startswith(folder + "/"):
+                return None, f"«{sub}» не внутри «{folder}» — исключить можно только её подпапку"
+            with dbc() as c:
+                known = c.execute("SELECT 1 FROM files WHERE path=? AND kind='dir'", (sub,)).fetchone()
+                names = [r[0] for r in c.execute(
+                    "SELECT name FROM files WHERE parent=? AND kind='dir' ORDER BY name", (parent_of(sub),))]
+            if not known:
+                return None, (f"папки «{sub}» программа на Диске не видела — проверь название"
+                              + (f". Папки в «{parent_of(sub)}»: " + ", ".join(f"«{n}»" for n in names) if names else ""))
+            if sub not in skip:
+                skip.append(sub)
+        self.scope, self.exclude = folder, skip
         set_setting("fl_scope", folder)
+        set_setting("fl_exclude", json.dumps(skip, ensure_ascii=False))
         return folder, None
 
     def update_settings(self, body):
@@ -2587,7 +2617,8 @@ class FileDownloader:
 
     def retry_failed(self):
         with dbc() as c:
-            return c.execute("UPDATE files SET fl_status=NULL, fl_error=NULL WHERE fl_status='failed'").rowcount
+            return c.execute("UPDATE files SET fl_status=NULL, fl_error=NULL "
+                             f"WHERE fl_status='failed' AND {self.scope_sql()}").rowcount
 
     # ---------- менеджер
 
@@ -3023,6 +3054,7 @@ class FileDownloader:
             "max_threads": FL_MAX_THREADS,
             "include_media": self.include_media,
             "scope": self.scope,
+            "exclude": self.exclude,
             "queue_size": FL_QUEUE_SIZE,
             "files_dir": os.path.join(os.path.abspath(files_dir()), FILES_SUBDIR),
             "speed": speed,
@@ -3081,12 +3113,12 @@ class CrawlState:
                 self.message = ""
 
     def next_folder(self):
-        """Следующая непройденная папка внутри выбранной (FL.scope), сначала верхние уровни.
+        """Следующая непройденная папка внутри выбранной (FL.scope, кроме FL.exclude), сначала верхние уровни.
         Саму выбранную папку ещё ни разу не видели — начинаем с неё."""
         scope = FL.scope
         with dbc() as c:
             row = c.execute(
-                f"SELECT path FROM files WHERE kind='dir' AND crawled_at IS NULL AND {subtree_sql(scope)} "
+                f"SELECT path FROM files WHERE kind='dir' AND crawled_at IS NULL AND {FL.scope_sql()} "
                 "ORDER BY length(path) - length(replace(path, '/', '')), path LIMIT 1").fetchone()
             path = row[0] if row else None
             if path is None and not c.execute("SELECT 1 FROM files WHERE path=?", (scope,)).fetchone():
@@ -3238,10 +3270,11 @@ def api_fl_retry_failed():
 
 @app.post("/api/fl/scope")
 def api_fl_scope():
-    folder, err = FL.set_scope((request.get_json(silent=True) or {}).get("folder", ""))
+    body = request.get_json(silent=True) or {}
+    folder, err = FL.set_scope(body.get("folder", ""), body.get("exclude") or ())
     if err:
         return jsonify(ok=False, error=err), 400
-    return jsonify(ok=True, scope=folder)
+    return jsonify(ok=True, scope=folder, exclude=FL.exclude)
 
 
 @app.get("/api/fl/damaged")
@@ -3774,9 +3807,10 @@ STATUS_HTML = r"""<!doctype html>
     $('cStart').textContent = scopeName ? `Обойти «${scopeName}» с подпапками` : 'Обойти все папки';
     if (!fScopeNote) {
       const empty = scopeName && !cr.run && c.dirs_crawled > 0 && c.files === 0;
-      $('fScopeMsg').textContent = !scopeName ? 'Сейчас: весь Диск.'
+      const except = (s.exclude || []).map(x => `«${x.slice(s.scope.length + 1)}»`).join(', ');
+      $('fScopeMsg').textContent = !scopeName ? 'Сейчас: весь Диск' + (except ? `, кроме ${except}.` : '.')
         : empty ? `В «${scopeName}» ничего не нашлось. Проверь название (регистр букв важен) — проще открыть папку во вкладке Диска и вставить сюда ссылку из адресной строки.`
-        : `Сейчас: только «${scopeName}» и её подпапки — обход, счётчики и загрузка.`;
+        : `Сейчас: только «${scopeName}» и её подпапки${except ? ', кроме ' + except : ''} — обход, счётчики и загрузка.`;
       $('fScopeMsg').className = empty ? 'warn' : 'mut';
     }
 

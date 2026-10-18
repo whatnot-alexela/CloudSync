@@ -5,7 +5,10 @@
 
     python fetch.py --folder Творчество --dest /root/yandex [--dump-dir DIR] [--threads N]
                     [--no-crawl] [--retry-failed] [--rclone gdrive:Яндекс [--reserve-gb 2] [--part-gb 5]]
+                    [--exclude Творчество/Проза ...]
     python fetch.py --status
+
+--folder / — весь Диск; --exclude — подпапка, которую не обходить и не качать (путь от корня Диска).
 
 Только stdlib. Запускает yandexdl-vps.sh fetch / status.
 """
@@ -148,6 +151,12 @@ def local_folder(st):
     return os.path.join(st["files_dir"], *rel.split("/")) if rel else st["files_dir"]
 
 
+def except_text(st):
+    """«, кроме «Проза», «Черновики»» — исключённые подпапки выбранной папки."""
+    names = [x[len(st["scope"]) + 1:] for x in st.get("exclude") or []]
+    return ", кроме " + ", ".join(f"«{n}»" for n in names) if names else ""
+
+
 def du(path):
     n = size = 0
     for root, _dirs, files in os.walk(path):
@@ -269,7 +278,7 @@ def report(st, mover=None, dmg=(0, 0, 0)):
     n, size = du(folder)
     print()
     print("=" * 70)
-    print(f"Папка на Диске:  {st['scope']}")
+    print(f"Папка на Диске:  {st['scope']}{except_text(st)}")
     print(f"Найдено файлов:  {c['files']} (из них фото/видео {c['media']}), папок {c['dirs']}")
     print(f"Скачано:         {c['done']} файлов, {human(c['done_bytes'])}")
     if dmg[0]:
@@ -291,7 +300,7 @@ def report(st, mover=None, dmg=(0, 0, 0)):
     print("=" * 70)
 
 
-def run(folder, dest, dump_dir, no_crawl=False, mover=None, threads=None, retry_failed=False):
+def run(folder, dest, dump_dir, no_crawl=False, mover=None, threads=None, retry_failed=False, exclude=()):
     if mover:
         mover.check()
     check_auth()
@@ -301,16 +310,19 @@ def run(folder, dest, dump_dir, no_crawl=False, mover=None, threads=None, retry_
     d = api("/api/settings/files-dir", {"dir": dest}, ok_codes=(200, 400))
     if not d.get("ok"):
         raise Fail(f"папка для загрузки {dest}: {d.get('error')}")
-    sc = api("/api/fl/scope", {"folder": folder}, ok_codes=(200, 400))
+    sc = api("/api/fl/scope", {"folder": folder, "exclude": list(exclude)}, ok_codes=(200, 400))
     if not sc.get("ok"):
         raise Fail(f"папка на Диске «{folder}»: {sc.get('error')}")
+    if exclude and sc.get("exclude") is None:
+        raise Fail("программа на сервере старая и не умеет --exclude — обнови её и перезапусти: yandexdl restart")
     if retry_failed:
         log(f"файлы с ошибками — в очередь заново: {api('/api/fl/retry-failed', {}).get('reset')}")
     settings = {"include_media": True}
     if threads:
         settings["threads"] = threads
     fs = api("/api/fl/settings", settings)["settings"]
-    log(f"папка на Диске: {sc['scope']}; качать в {d['dir']}; фото/видео из папок: да; потоков: {fs['threads']}"
+    log(f"папка на Диске: {sc['scope']}{except_text(sc)}; качать в {d['dir']}; фото/видео из папок: да; "
+        f"потоков: {fs['threads']}"
         + (f"; переносить в {mover.remote}" if mover else ""))
 
     if no_crawl:
@@ -364,7 +376,7 @@ def status():
     c, cr, a = st["counts"], st["crawl"], st["auth"]
     print(f"Вход в Яндекс: кук {a['cookies']}, sk {'есть' if a['has_sk'] else 'нет'}, "
           f"Session_id {'есть' if a['has_session'] else 'нет'}")
-    print(f"Папка: {st['scope']}  →  {local_folder(st)}")
+    print(f"Папка: {st['scope']}{except_text(st)}  →  {local_folder(st)}")
     print(f"Обход: {'идёт, сейчас ' + str(cr['current']) if cr['run'] else 'не идёт'}"
           f"{' — ' + cr['message'] if cr.get('message') else ''}")
     print(f"Найдено: файлов {c['files']} (фото/видео {c['media']}), папок {c['dirs']}")
@@ -385,6 +397,8 @@ def main():
     p.add_argument("--part-gb", type=float, help="с --rclone: переносить каждые столько скачанных ГБ")
     p.add_argument("--threads", type=int, help="сколько файлов качать одновременно (1–8)")
     p.add_argument("--retry-failed", action="store_true", help="ещё раз попробовать файлы, которые не скачались")
+    p.add_argument("--exclude", action="append", default=[], metavar="ПАПКА",
+                   help="подпапка --folder, которую не обходить и не качать (путь от корня Диска; можно несколько раз)")
     a = p.parse_args()
     try:
         if a.status:
@@ -394,7 +408,7 @@ def main():
             p.error("--folder обязателен")
         mover = Mover(a.rclone, a.reserve_gb, a.part_gb) if a.rclone else None
         return run(a.folder, a.dest, a.dump_dir, no_crawl=a.no_crawl, mover=mover, threads=a.threads,
-                   retry_failed=a.retry_failed)
+                   retry_failed=a.retry_failed, exclude=a.exclude)
     except Fail as e:
         print(f"\nОшибка: {e}", flush=True)
         return 3
