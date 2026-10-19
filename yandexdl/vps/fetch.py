@@ -11,7 +11,8 @@
 --folder / — весь Диск; --exclude — подпапка, которую не обходить и не качать (путь от корня Диска).
 Повторный запуск продолжает с того места, где остановился: пройденные обходом папки заново не открываются
 (обойти всё заново — --recrawl), скачанное не перекачивается, оставшееся на сервере сначала уезжает в облако.
-Если программа посреди работы перезапустилась, обход и скачивание продолжаются сами.
+Если программа посреди работы перезапустилась, обход и скачивание продолжаются сами; зависла (6 минут не отвечает) —
+fetch перезапускает её и продолжает.
 
 Только stdlib. Запускает yandexdl-vps.sh fetch / status.
 """
@@ -29,6 +30,11 @@ API = os.environ.get("YDISK_API", "http://127.0.0.1:8001")
 FILES_SUBDIR = "Диск"
 GB = 1024 ** 3
 _OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+API_TIMEOUT = 60              # сек на ответ программы
+API_RETRY_PAUSE = 30          # сек между попытками
+API_HANG_RESTART = 6 * 60     # сек подряд без ответа — программа зависла: перезапустить её
+API_HANG_RESTARTS = 3         # столько перезапусков подряд не помогло — сдаться
+RESTART_CMD = ["systemctl", "restart", "yandexdl-app"]
 
 
 class Fail(Exception):
@@ -39,10 +45,13 @@ def api(path, body=None, ok_codes=(200,)):
     data, headers = None, {}
     if body is not None:
         data, headers = json.dumps(body).encode("utf-8"), {"Content-Type": "application/json"}
-    for attempt in range(1, 11):
+    silent_since, restarts = time.time(), 0     # с каких пор программа молчит; сколько раз её перезапустили
+    attempt = 0
+    while True:
+        attempt += 1
         req = urllib.request.Request(API + path, data=data, headers=headers, method="POST" if body is not None else "GET")
         try:
-            with _OPENER.open(req, timeout=60) as resp:
+            with _OPENER.open(req, timeout=API_TIMEOUT) as resp:
                 return json.loads(resp.read())
         except urllib.error.HTTPError as e:
             try:
@@ -57,12 +66,52 @@ def api(path, body=None, ok_codes=(200,)):
             if attempt == 10:
                 raise Fail(f"{path}: программа раз за разом отвечает HTTP {e.code} — смотри «yandexdl logs»")
             why = f"HTTP {e.code}"
-        except OSError as e:   # программа занята или перезапускается: подождать и спросить снова
-            if attempt == 10:
-                raise
+            silent_since = time.time()  # отвечает, хоть и ошибкой, — не зависла
+        except OSError as e:   # программа занята, перезапускается или зависла: подождать и спросить снова
             why = e
-        print(time.strftime("%H:%M:%S"), f"(!) программа не ответила ({why}), повторяю через 30 с", flush=True)
-        time.sleep(30)
+            silent = time.time() - silent_since
+            if silent >= API_HANG_RESTART:
+                # Молчит несколько минут: процесс жив, но завис (так бывает, когда кончается память), и systemd
+                # сам его не перезапустит. Перезапускаем: вход в Яндекс сохраняется, а обход и скачивание
+                # продолжает тот, кто спрашивал, — он видит новое время запуска программы.
+                if restarts >= API_HANG_RESTARTS or not restart_program(why, silent):
+                    raise
+                restarts += 1
+                silent_since = time.time()
+                continue
+        print(time.strftime("%H:%M:%S"), f"(!) программа не ответила ({why}), повторяю через {API_RETRY_PAUSE} с",
+              flush=True)
+        time.sleep(API_RETRY_PAUSE)
+
+
+def memory_text():
+    """«доступно памяти 95.0 МБ из 1.9 ГБ, подкачка занята 1.7 из 2.0 ГБ» — по логу видно, не память ли кончилась."""
+    try:
+        with open("/proc/meminfo", encoding="ascii") as f:
+            m = {k: int(v.split()[0]) * 1024 for k, v in (line.split(":", 1) for line in f)}
+    except (OSError, ValueError, IndexError):
+        return ""
+    text = f"доступно памяти {human(m.get('MemAvailable', 0))} из {human(m.get('MemTotal', 0))}"
+    if m.get("SwapTotal"):
+        text += f", подкачка занята {human(m['SwapTotal'] - m.get('SwapFree', 0))} из {human(m['SwapTotal'])}"
+    return text
+
+
+def restart_program(why, silent):
+    """Перезапустить зависшую программу (её службу systemd на VPS). True — перезапущена."""
+    if not shutil.which(RESTART_CMD[0]):
+        return False
+    log(f"(!) программа не отвечает {int(silent // 60)} мин ({why}); {memory_text() or 'сколько памяти — не знаю'} — "
+        f"перезапускаю её: {' '.join(RESTART_CMD)}")
+    try:
+        r = subprocess.run(RESTART_CMD, capture_output=True, text=True, timeout=300)
+    except (OSError, subprocess.SubprocessError) as e:
+        log(f"(!) перезапустить программу не вышло: {e}")
+        return False
+    if r.returncode:
+        log(f"(!) перезапустить программу не вышло (код {r.returncode}): {(r.stderr or r.stdout).strip()[:300]}")
+        return False
+    return True
 
 
 def human(n):
