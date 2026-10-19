@@ -308,9 +308,24 @@ cmd_fetch() {
   sleep 1; kill $jpid 2>/dev/null || true
 }
 
+mem_text() {     # «доступно памяти 95 из 1987 МБ, подкачка занята 1700 из 2047 МБ»
+  awk '/^MemTotal:/{t=$2} /^MemAvailable:/{a=$2} /^SwapTotal:/{st=$2} /^SwapFree:/{sf=$2}
+       END{printf "доступно памяти %d из %d МБ", a/1024, t/1024; if (st) printf ", подкачка занята %d из %d МБ", (st-sf)/1024, st/1024}' /proc/meminfo
+}
+
 cmd_status() {
-  wait_api 3 || die "программа не запущена: yandexdl start"
-  "$VENV/bin/python" -u "$APP_DIR/vps/fetch.py" --status
+  if wait_api 5; then
+    "$VENV/bin/python" -u "$APP_DIR/vps/fetch.py" --status
+  elif systemctl is-active -q yandexdl-app; then
+    echo "(!) Программа запущена, но не отвечает: только что запускается, сильно занята или зависла ($(mem_text))."
+    if systemctl is-active -q yandexdl-fetch; then
+      echo "    Задание fetch ждёт её само, а после 6 минут молчания перезапускает."
+    else
+      echo "    Не ответит и через пару минут — перезапусти её: yandexdl restart"
+    fi
+  else
+    echo "(!) Программа не запущена: yandexdl start"
+  fi
   local src
   if src=$(stale_src); then
     echo "(!) Код в $src не совпадает с установленным, работает установленный — поставь новый: yandexdl update"
