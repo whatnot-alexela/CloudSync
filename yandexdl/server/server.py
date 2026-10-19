@@ -43,7 +43,7 @@ import urllib.error
 import urllib.request
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from urllib.parse import unquote, urlparse
+from urllib.parse import unquote, urlencode, urlparse
 from contextlib import contextmanager
 from datetime import datetime, timezone
 
@@ -215,6 +215,8 @@ VD_LIMITS = {
 
 # --- остальные файлы Диска (раздел «Файлы»): документы, архивы, музыка и т. д. ---
 FILES_SUBDIR = "Диск"       # files_dir()/Диск/<путь на Диске>, структура папок сохраняется
+PUBLIC_SUBDIR = "Ссылки"    # общие папки по ссылкам (в базе /public/<id>/…): files_dir()/Ссылки/<id>/<путь в папке>
+PUBLIC_API = os.environ.get("YDISK_PUBLIC_API", "https://cloud-api.yandex.net/v1/disk/public/resources")
 FL_QUEUE_SIZE = 50          # сколько файлов ждут в очереди
 FL_DEFAULT_THREADS = 3
 FL_MAX_THREADS = 8
@@ -719,8 +721,62 @@ def find_key(obj, key):
     return None
 
 
+class LinkLimit(AuthError):
+    """Диск больше не даёт качать по общей ссылке (лимит скачиваний): загрузку остановить, повторить позже."""
+
+    def __init__(self, what=""):
+        super().__init__("Яндекс не даёт качать по ссылке: превышен лимит скачиваний" + (f" ({what})" if what else ""))
+
+
+def public_roots():
+    """Общие папки по ссылкам: {id: {"key": ссылка, "name": имя, "file": ссылка на один файл,
+    "listed": {путь подпапки: когда её список собран целиком}}}."""
+    try:
+        roots = json.loads(get_setting("fl_public", "{}"))
+    except (TypeError, ValueError):
+        return {}
+    return roots if isinstance(roots, dict) else {}
+
+
+def public_root_of(path):
+    """/public/<id>/Папка/книга.pdf -> («<id>», «/Папка/книга.pdf»); не из общей папки — (None, None)."""
+    if not path.startswith("/public/"):
+        return None, None
+    pid, _, rel = path[len("/public/"):].partition("/")
+    return pid, "/" + rel
+
+
+def public_download_url(path):
+    """Файл общей папки: прямая ссылка из открытого API Диска (вход не нужен, куки и sk не участвуют)."""
+    pid, rel = public_root_of(path)
+    root = public_roots().get(pid)
+    if not root:
+        raise VideoError("эту общую ссылку программа не знает — запусти fetch с самой ссылкой")
+    params = {"public_key": root["key"]} if root.get("file") else {"public_key": root["key"], "path": rel}
+    req = urllib.request.Request(PUBLIC_API + "/download?" + urlencode(params), headers={"User-Agent": USER_AGENT})
+    try:
+        with VD.opener.open(req, timeout=API_TIMEOUT) as resp:
+            data = json.loads(resp.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as e:
+        try:
+            body = json.loads(e.read() or b"{}")
+        except ValueError:
+            body = {}
+        what = f"{body.get('error') or ''} {body.get('description') or ''}".strip()
+        if e.code == 429 or "limit" in what.lower() or "лимит" in what.lower():
+            raise LinkLimit(what)
+        raise VideoError(f"ссылка на файл: HTTP {e.code}" + (f" {what}" if what else ""))
+    except (urllib.error.URLError, socket.timeout, TimeoutError, OSError, ValueError) as e:
+        raise VideoError(f"ссылка на файл: {short_err(e)}")
+    if not isinstance(data, dict) or not data.get("href"):
+        raise VideoError("Диск не дал ссылку на файл")
+    return data["href"]
+
+
 def get_download_url(path: str) -> str:
     """POST models-v2?m=mpfs/url с сохранёнными куками и sk -> прямая ссылка на скачивание."""
+    if path.startswith("/public/"):
+        return public_download_url(path)
     a = load_auth()
     if not a["cookies"] or not a["sk"]:
         raise AuthError("нет данных авторизации: открой Яндекс Диск в браузере через mitmproxy "
@@ -2389,11 +2445,15 @@ def _safe_component(part):
 
 
 def disk_rel_path(path):
-    """/disk/Папка/отчёт.pdf -> «Диск/Папка/отчёт.pdf» (относительно files_dir())."""
+    """/disk/Папка/отчёт.pdf -> «Диск/Папка/отчёт.pdf», /public/<id>/Папка/книга.pdf -> «Ссылки/<id>/Папка/книга.pdf»
+    (относительно files_dir())."""
     parts = [p for p in path.split("/") if p]
+    top = FILES_SUBDIR
     if parts and parts[0] == "disk":
         parts = parts[1:]
-    return "/".join([FILES_SUBDIR] + [_safe_component(p) for p in parts])
+    elif parts and parts[0] == "public":
+        top, parts = PUBLIC_SUBDIR, parts[1:]
+    return "/".join([top] + [_safe_component(p) for p in parts])
 
 
 def normalize_disk_folder(value):
@@ -2434,9 +2494,8 @@ def _sql_str(s):
 
 
 def subtree_sql(folder):
-    """Условие «path — сама папка folder или что-то внутри неё». Без LIKE: в именах бывают % и _."""
-    if folder == "/disk":
-        return "1"
+    """Условие «path — сама папка folder или что-то внутри неё». Без LIKE: в именах бывают % и _.
+    Весь Диск — тоже только /disk/…: рядом в той же таблице лежат общие папки по ссылкам (/public/…)."""
     inside = _sql_str(folder + "/")
     return f"(path = {_sql_str(folder)} OR substr(path, 1, length({inside})) = {inside})"
 
@@ -2532,8 +2591,12 @@ class FileDownloader:
         except (TypeError, ValueError):
             self.threads = FL_DEFAULT_THREADS
         self.include_media = get_setting("fl_include_media", "0") == "1"
-        scope, err = normalize_disk_folder(get_setting("fl_scope", "/disk"))
-        self.scope = scope if not err else "/disk"
+        saved = get_setting("fl_scope", "/disk")
+        if saved.startswith("/public/"):           # общая папка по ссылке: путь хранится как есть
+            self.scope = saved
+        else:
+            scope, err = normalize_disk_folder(saved)
+            self.scope = scope if not err else "/disk"
         try:
             self.exclude = [x for x in json.loads(get_setting("fl_exclude", "[]")) if isinstance(x, str)]
         except (TypeError, ValueError):
@@ -2544,20 +2607,18 @@ class FileDownloader:
         которые при этом не трогать (пути как у value). Без exclude прежние исключения снимаются."""
         if self.state() != "idle" or CRAWL.run:
             return None, "сначала останови загрузку файлов и обход, потом меняй папку"
-        folder, err = normalize_disk_folder(value)
+        folder, err = self._folder(value)
         if err:
             return None, err
-        folder = known_folder_case(folder)
         if isinstance(exclude, str):
             exclude = [exclude]
         if not isinstance(exclude, (list, tuple)):
             return None, "exclude — список папок"
         skip = []
         for x in exclude or ():
-            sub, err = normalize_disk_folder(x) if isinstance(x, str) else (None, "нужна строка")
+            sub, err = self._folder(x) if isinstance(x, str) else (None, "нужна строка")
             if err:
                 return None, f"исключение «{x}»: {err}"
-            sub = known_folder_case(sub)
             if not sub.startswith(folder + "/"):
                 return None, f"«{sub}» не внутри «{folder}» — исключить можно только её подпапку"
             with dbc() as c:
@@ -2573,6 +2634,20 @@ class FileDownloader:
         set_setting("fl_scope", folder)
         set_setting("fl_exclude", json.dumps(skip, ensure_ascii=False))
         return folder, None
+
+    @staticmethod
+    def _folder(value):
+        """Папка Диска («Творчество», ссылка на неё…) или общей папки по ссылке (/public/<id>/…) -> (путь, ошибка)."""
+        if isinstance(value, str) and value.startswith("/public/"):
+            pid, rel = public_root_of(value)
+            if pid not in public_roots():
+                return None, "эту общую ссылку программа не знает — запусти fetch с самой ссылкой"
+            parts = [x.strip() for x in rel.split("/") if x.strip()]
+            if any(x in (".", "..") for x in parts):
+                return None, "в пути не может быть «.» и «..»"
+            return "/public/" + pid + "".join("/" + x for x in parts), None
+        folder, err = normalize_disk_folder(value)
+        return (None, err) if err else (known_folder_case(folder), None)
 
     def update_settings(self, body):
         errors = []
@@ -2824,6 +2899,8 @@ class FileDownloader:
             if e.code == 416 and have:
                 os.remove(tmp)
                 raise IOError("сервер не принял докачку (HTTP 416) — начну заново")
+            if e.code == 429 and path.startswith("/public/"):
+                raise LinkLimit("HTTP 429") from e
             raise
         with resp:
             if have:
@@ -2917,6 +2994,8 @@ class FileDownloader:
                             self.window.append((time.monotonic(), len(chunk)))
                 except urllib.error.HTTPError as e:
                     link["http"] = e.code
+                    if e.code == 429 and path.startswith("/public/"):
+                        raise LinkLimit("HTTP 429") from e
                     if e.code in (401, 403, 410):      # ссылка просрочена — берём новую
                         fresh_url(url)
                         continue
@@ -3076,6 +3155,7 @@ class FileDownloader:
             "include_media": self.include_media,
             "scope": self.scope,
             "exclude": self.exclude,
+            "public": public_roots().get(public_root_of(self.scope)[0]) if self.scope.startswith("/public/") else None,
             "queue_size": FL_QUEUE_SIZE,
             "files_dir": os.path.join(os.path.abspath(files_dir()), FILES_SUBDIR),
             "speed": speed,
@@ -3298,6 +3378,64 @@ def api_fl_scope():
     if err:
         return jsonify(ok=False, error=err), 400
     return jsonify(ok=True, scope=folder, exclude=FL.exclude)
+
+
+def ingest_public(pid, key, name, files, listed, single=False):
+    """Кусок списка общей папки по ссылке (его собирает vps/fetch.py через открытое API Диска): файлы
+    /public/<id><путь>, их папки — сразу пройденными (браузер их не открывает). listed — путь подпапки, список
+    которой этим вызовом собран целиком: повторный fetch его не собирает заново."""
+    ts = now_iso()
+    roots = public_roots()
+    root = roots.get(pid) or {}
+    root.update(key=key, name=name or root.get("name") or pid)
+    if single:
+        root["file"] = True
+    if listed is not None:
+        root.setdefault("listed", {})[listed] = ts
+    roots[pid] = root
+    set_setting("fl_public", json.dumps(roots, ensure_ascii=False))
+    base = "/public/" + pid
+    dirs, n = {base}, 0
+    with dbc() as c:
+        for f in files:
+            rel, size = (f.get("path"), f.get("size")) if isinstance(f, dict) else (None, None)
+            if not isinstance(rel, str) or not rel.startswith("/") or any(x in (".", "..") for x in rel.split("/")):
+                continue
+            path = base + rel.rstrip("/")
+            fname = name_from_path(path)
+            c.execute("INSERT INTO files(path, parent, name, kind, size, is_media, first_seen, updated_at) "
+                      "VALUES(?,?,?,'file',?,?,?,?) ON CONFLICT(path) DO UPDATE SET "
+                      "size=COALESCE(excluded.size, files.size), kind='file', updated_at=excluded.updated_at",
+                      (path, parent_of(path), fname, _as_int(size), int(is_media_file(fname, None)), ts, ts))
+            n += 1
+            q = parent_of(path)
+            while q and q not in dirs and q.startswith(base + "/"):
+                dirs.add(q)
+                q = parent_of(q)
+        for d in dirs:
+            c.execute("INSERT INTO files(path, parent, name, kind, first_seen, updated_at, listed_at, crawled_at) "
+                      "VALUES(?,?,?,'dir',?,?,?,?) ON CONFLICT(path) DO UPDATE SET "
+                      "listed_at=COALESCE(files.listed_at, excluded.listed_at), crawled_at=excluded.crawled_at",
+                      (d, parent_of(d), root["name"] if d == base else name_from_path(d), ts, ts, ts, ts))
+    return n
+
+
+@app.get("/api/fl/public")
+def api_fl_public_get():
+    return jsonify(roots=public_roots())
+
+
+@app.post("/api/fl/public")
+def api_fl_public():
+    body = request.get_json(silent=True) or {}
+    pid, key = body.get("id"), body.get("key")
+    if not (isinstance(pid, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,64}", pid)) \
+            or not (isinstance(key, str) and key.startswith("http")):
+        return jsonify(ok=False, error="нужны id (буквы, цифры, - и _) и key (ссылка)"), 400
+    listed = body.get("listed")
+    n = ingest_public(pid, key, body.get("name"), body.get("files") or [],
+                      listed if isinstance(listed, str) else None, bool(body.get("file")))
+    return jsonify(ok=True, files=n, root=public_roots().get(pid))
 
 
 @app.get("/api/fl/damaged")

@@ -10,6 +10,7 @@
 #        [--no-crawl] [--rclone gdrive:Папка] [--threads 1]   без обхода; частями в облако; потоки
 #        [--exclude Папка]…                  кроме этой подпапки (путь от корня Диска, можно несколько раз)
 #        повтор той же команды продолжает с места остановки; [--recrawl] — обойти все папки заново
+#        вместо папки — общая ссылка disk.yandex.ru/d/… (или на её подпапку): её файлы, список — без обхода
 #   bash yandexdl-vps.sh pick Папка         оставить в папке только выбранные подпапки и обойти их
 #   bash yandexdl-vps.sh status             что сейчас происходит
 #   bash yandexdl-vps.sh diagnose           в каком виде Диск отдаёт списки папок (если файлов 0)
@@ -346,5 +347,5 @@ case "${1:-}" in
   pick)     shift; cmd_pick "$@" ;;
   diagnose) cmd_diagnose ;;
   logs)     shift; cmd_logs "$@" ;;
-  *) sed -n '2,16p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 1 ;;
+  *) sed -n '2,17p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac

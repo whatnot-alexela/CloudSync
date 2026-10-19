@@ -28,6 +28,7 @@ import urllib.request
 
 API = os.environ.get("YDISK_API", "http://127.0.0.1:8001")
 FILES_SUBDIR = "Диск"
+PUBLIC_SUBDIR = "Ссылки"      # общие папки по ссылкам: <папка загрузки>/Ссылки/<id>/…, в программе — /public/<id>/…
 GB = 1024 ** 3
 _OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 API_TIMEOUT = 60              # сек на ответ программы
@@ -35,6 +36,8 @@ API_RETRY_PAUSE = 30          # сек между попытками
 API_HANG_RESTART = 6 * 60     # сек подряд без ответа — программа зависла: перезапустить её
 API_HANG_RESTARTS = 3         # столько перезапусков подряд не помогло — сдаться
 RESTART_CMD = ["systemctl", "restart", "yandexdl-app"]
+LIMIT_WAIT = 60 * 60          # сек: Яндекс ограничил скачивание по общей ссылке — подождать и попробовать снова
+LIMIT_WAITS = 48              # столько ожиданий подряд без единого скачанного файла — сдаться
 
 
 class Fail(Exception):
@@ -219,6 +222,7 @@ def download_round(mover=None):
     start_download()
     last_print = 0
     restarts = done_then = 0
+    limit_waits, limit_done = 0, None
     while True:
         time.sleep(5)
         st = api("/api/fl/status")
@@ -230,6 +234,19 @@ def download_round(mover=None):
             msg = st.get("message") or ""
             left = left_files(c)
             no_space = bool(mover) and msg.startswith("Нет места")
+            if left and msg.startswith("Остановился") and "лимит" in msg:
+                # Яндекс ограничил скачивание по общей ссылке: обычно на сутки. Ждём и пробуем снова, пока
+                # между ограничениями что-то качается; LIMIT_WAITS ожиданий подряд впустую — сдаёмся.
+                limit_waits = limit_waits + 1 if c["done"] == limit_done else 1
+                limit_done = c["done"]
+                if limit_waits <= LIMIT_WAITS:
+                    log(f"(!) {msg[len('Остановился: '):]} — переношу скачанное и жду {LIMIT_WAIT // 60} мин, "
+                        f"потом пробую снова ({limit_waits}-й раз подряд из {LIMIT_WAITS})")
+                    if mover:
+                        mover.move(api("/api/fl/status"))
+                    time.sleep(LIMIT_WAIT)
+                    start_download()
+                    continue
             if left and (crashed or no_space or msg.startswith("ошибка менеджера")):
                 # Встало, не докачав, не по нашей воле: программу перезапустили, упал её менеджер загрузки
                 # или кончилось место. Запускаем снова; пять раз подряд без толку — сдаёмся.
@@ -272,9 +289,30 @@ def free_bytes(path):
     return shutil.disk_usage(path).free
 
 
+def public_base(st):
+    """Общая папка по ссылке: где на сервере лежит её корень (<папка загрузки>/Ссылки/<id>); иначе None."""
+    if not st["scope"].startswith("/public/"):
+        return None
+    pid = st["scope"][len("/public/"):].split("/", 1)[0]
+    return os.path.join(os.path.dirname(st["files_dir"]), PUBLIC_SUBDIR, pid)
+
+
 def local_folder(st):
+    base = public_base(st)
+    if base:
+        rel = st["scope"][len("/public/"):].split("/", 1)[1:]
+        return os.path.join(base, *rel[0].split("/")) if rel else base
     rel = st["scope"][len("/disk"):].strip("/")
     return os.path.join(st["files_dir"], *rel.split("/")) if rel else st["files_dir"]
+
+
+def scope_title(st):
+    """«/disk/Творчество» или для общей папки «Библиотека/Английский язык» (по ссылке https://…)."""
+    pub = st.get("public")
+    if not st["scope"].startswith("/public/") or not pub:
+        return st["scope"]
+    sub = st["scope"][len("/public/"):].partition("/")[2]
+    return f"«{pub.get('name')}{'/' + sub if sub else ''}» (по ссылке {pub.get('key')})"
 
 
 def except_text(st):
@@ -338,7 +376,7 @@ class Mover:
             raise Fail(f"в rclone нет облака {name} (есть: {', '.join(have) or 'никаких'}) — настрой его: rclone config")
 
     def target(self, st):
-        rel = os.path.relpath(local_folder(st), st["files_dir"]).replace(os.sep, "/")
+        rel = os.path.relpath(local_folder(st), public_base(st) or st["files_dir"]).replace(os.sep, "/")
         base = self.remote if self.remote.endswith(":") else self.remote.rstrip("/") + "/"
         return base + ("" if rel == "." else rel)
 
@@ -443,7 +481,7 @@ def report(st, mover=None, dmg=(0, 0, 0)):
     n, size = du(folder)
     print()
     print("=" * 70)
-    print(f"Папка на Диске:  {st['scope']}{except_text(st)}")
+    print(f"{'Общая папка: ' if st.get('public') else 'Папка на Диске:'}  {scope_title(st)}{except_text(st)}")
     print(f"Найдено файлов:  {c['files']} (из них фото/видео {c['media']}), папок {c['dirs']}")
     if c["dirs"] > c["dirs_crawled"]:
         print(f"Не пройдено обходом: {c['dirs'] - c['dirs_crawled']} папок — их файлы ещё не найдены, "
@@ -470,12 +508,47 @@ def report(st, mover=None, dmg=(0, 0, 0)):
     print("=" * 70)
 
 
+def parse_public(folder):
+    """Общая ссылка disk.yandex.ru/d/…, yadi.sk/d/…, …/i/… -> (ключ, подпапка), иначе None."""
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import public
+    return public.parse_link(folder)
+
+
+def list_public(key, sub, recrawl=False, exclude=()):
+    """Список общей папки по ссылке — в программу (один раз: повтор берёт собранный, заново — --recrawl).
+    Возвращает её путь в программе (/public/<id>[/подпапка]) и исключения так же (они — от корня ссылки)."""
+    import public
+    pid = public.public_id(key)
+    root = api("/api/fl/public")["roots"].get(pid) or {}
+    listed = [x for x in (root.get("listed") or {}) if sub == x or sub.startswith(x.rstrip("/") + "/")]
+    if listed and not recrawl:
+        log(f"список «{root.get('name')}{'' if sub == '/' else sub}» по ссылке уже собран — беру его "
+            "(собрать заново, если там появились файлы: --recrawl)")
+    else:
+        log("собираю список файлов по ссылке через API Диска" + ("" if sub == "/" else f" (подпапка {sub})")
+            + " — у большой папки это минуты, у огромной — до получаса")
+        try:
+            name, files, single = public.walk(key, sub, progress=log)
+        except public.Fail as e:
+            raise Fail(f"ссылка {key}: {e}")
+        for i in range(0, len(files), 2000):
+            api("/api/fl/public", {"id": pid, "key": key, "name": name, "file": single,
+                                   "files": [{"path": p, "size": size} for p, size in files[i:i + 2000]]})
+        api("/api/fl/public", {"id": pid, "key": key, "name": name, "file": single, "files": [], "listed": sub})
+        log(f"по ссылке «{name}{'' if sub == '/' else sub}»: файлов {len(files)}, {human(sum(x[1] for x in files))}")
+    base = "/public/" + pid
+    return base + ("" if sub == "/" else sub.rstrip("/")), [base + "/" + x.strip("/") for x in exclude]
+
+
 def run(folder, dest, dump_dir, no_crawl=False, recrawl=False, mover=None, threads=None, retry_failed=False,
         exclude=()):
     log(f"программа: {installed_version() or 'версия не записана (поставлена старым install)'}")
     if mover:
         mover.check()
-    check_auth()
+    link = parse_public(folder)
+    if not link:        # общая папка по ссылке качается без входа в Яндекс
+        check_auth()
     api("/api/fl/stop", {})
     api("/api/fl/crawl", {"run": False})
     wait_idle()
@@ -485,6 +558,9 @@ def run(folder, dest, dump_dir, no_crawl=False, recrawl=False, mover=None, threa
     d = api("/api/settings/files-dir", {"dir": dest}, ok_codes=(200, 400))
     if not d.get("ok"):
         raise Fail(f"папка для загрузки {dest}: {d.get('error')}")
+    if link:        # общая папка по ссылке: список — из API Диска, обход браузером не нужен
+        folder, exclude = list_public(*link, recrawl=recrawl, exclude=exclude)
+        no_crawl = True
     sc = api("/api/fl/scope", {"folder": folder, "exclude": list(exclude)}, ok_codes=(200, 400))
     if not sc.get("ok"):
         raise Fail(f"папка на Диске «{folder}»: {sc.get('error')}")
@@ -496,13 +572,16 @@ def run(folder, dest, dump_dir, no_crawl=False, recrawl=False, mover=None, threa
     if threads:
         settings["threads"] = threads
     fs = api("/api/fl/settings", settings)["settings"]
-    log(f"папка на Диске: {sc['scope']}{except_text(sc)}; качать в {d['dir']}; фото/видео из папок: да; "
+    log(f"{'общая папка' if link else 'папка на Диске'}: {scope_title(api('/api/fl/status'))}{except_text(sc)}; "
+        f"качать в {d['dir']}; фото/видео из папок: да; "
         f"потоков: {fs['threads']}"
         + (f"; переносить в {mover.remote}" if mover else ""))
 
     c = api("/api/fl/status")["counts"]
     crawled = bool(c["dirs"]) and c["dirs_crawled"] >= c["dirs"]
-    if no_crawl:
+    if link:
+        pass
+    elif no_crawl:
         log("обход пропускаю: беру список файлов, собранный раньше")
     elif crawled and c["files"] and not recrawl:
         log(f"все папки ({c['dirs']}) уже пройдены обходом — обход пропускаю, беру собранный список "
@@ -523,6 +602,8 @@ def run(folder, dest, dump_dir, no_crawl=False, recrawl=False, mover=None, threa
         f"к скачиванию {c['remaining']} файлов, {human(c['remaining_bytes'])}")
     if c["files"] and c["dirs"] > c["dirs_crawled"]:
         log(f"(!) обходом пройдены не все папки (осталось {c['dirs'] - c['dirs_crawled']}) — качаю то, что уже найдено")
+    if not c["files"] and link:
+        raise Fail("по этой ссылке файлов не нашлось — проверь ссылку (и подпапку в ней, если она указана)")
     if not c["files"] and no_crawl:
         raise Fail(f"в собранном списке нет файлов в «{sc['scope']}» — проверь название или запусти без --no-crawl")
     if not c["files"]:
@@ -553,6 +634,9 @@ def run(folder, dest, dump_dir, no_crawl=False, recrawl=False, mover=None, threa
         mover.move(st, final=True)
     report(st, mover, dmg)
     msg, c = st.get("message") or "", st["counts"]
+    if msg.startswith("Остановился") and "лимит" in msg:
+        raise Fail("Яндекс больше не даёт качать по этой ссылке (превышен лимит скачиваний). Обычно лимит снимается "
+                   "через сутки — тогда повтори ту же команду: скачанное не перекачается, список заново не собирается")
     if msg.startswith("Остановился"):
         raise Fail("скачивание прервалось из-за входа в Яндекс: войди заново через «yandexdl vnc», "
                    "открой Диск и повтори ту же команду — уже скачанное не перекачается, обход заново не начнётся")
@@ -576,7 +660,7 @@ def status():
     print(f"Версия: {installed_version() or 'не записана (поставлена старым install)'}")
     print(f"Вход в Яндекс: кук {a['cookies']}, sk {'есть' if a['has_sk'] else 'нет'}, "
           f"Session_id {'есть' if a['has_session'] else 'нет'}")
-    print(f"Папка: {st['scope']}{except_text(st)}  →  {local_folder(st)}")
+    print(f"Папка: {scope_title(st)}{except_text(st)}  →  {local_folder(st)}")
     print(f"Обход: {'идёт, сейчас ' + str(cr['current']) if cr['run'] else 'не идёт'}"
           f"{' — ' + cr['message'] if cr.get('message') else ''}")
     print(f"Найдено: файлов {c['files']} (фото/видео {c['media']}), папок {c['dirs']}")
