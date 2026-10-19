@@ -218,6 +218,8 @@ FILES_SUBDIR = "Диск"       # files_dir()/Диск/<путь на Диске
 PUBLIC_SUBDIR = "Ссылки"    # общие папки по ссылкам (в базе /public/<id>/…): files_dir()/Ссылки/<id>/<путь в папке>
 PUBLIC_API = os.environ.get("YDISK_PUBLIC_API", "https://cloud-api.yandex.net/v1/disk/public/resources")
 FL_QUEUE_SIZE = 50          # сколько файлов ждут в очереди
+FL_SNAPSHOT_TTL = 3         # сек: счётчики для статуса считаются по базе не чаще (дольше, если подсчёт сам долгий)
+FL_DRY_RETRY = 30           # сек: в очередь больше нечего взять — следующий поиск по базе не раньше
 FL_DEFAULT_THREADS = 3
 FL_MAX_THREADS = 8
 FL_ATTEMPTS = 5             # попыток на файл: каждая со свежей ссылкой, докачка с места обрыва
@@ -2505,6 +2507,18 @@ def _with_tag(rel, path):
     return f"{stem}_{hashlib.md5(path.encode('utf-8')).hexdigest()[:8]}{ext}"
 
 
+def _files_on_disk(root):
+    """Файлы, которые лежат в папке загрузок (в «Диск» и «Ссылки»): пути относительно root, через «/».
+    Строк в базе бывают сотни тысяч (общая папка по ссылке), а скачанное обычно уже уехало в облако: один проход
+    по папке вместо проверки на диске каждой строки — иначе запуск программы тянется минутами."""
+    found = set()
+    for top in (FILES_SUBDIR, PUBLIC_SUBDIR):
+        for dirpath, _dirs, names in os.walk(os.path.join(root, top)):
+            rel = os.path.relpath(dirpath, root).replace(os.sep, "/")
+            found.update(rel + "/" + n for n in names)
+    return found
+
+
 def reconcile_existing_files(paths=None):
     """Помечает как done файлы, которые уже лежат в папке загрузок (тот же путь и тот же размер).
     Как и у фото/видео, статус done потом не сбрасывается, даже если файл удалить вручную."""
@@ -2522,12 +2536,16 @@ def reconcile_existing_files(paths=None):
                 rows.extend(c.execute(f"{base} AND path IN ({','.join('?' * len(batch))})", batch).fetchall())
         if not rows:
             return 0
+        on_disk = _files_on_disk(root) if len(rows) > 1000 else None
+        if on_disk is not None and not on_disk:
+            return 0
         claimed = {r[0] for r in c.execute("SELECT fl_file FROM files WHERE fl_status='done' AND fl_file IS NOT NULL")}
         ts = now_iso()
         updates = []
         for row in rows:
-            for rel in (disk_rel_path(row["path"]), _with_tag(disk_rel_path(row["path"]), row["path"])):
-                if rel in claimed:
+            plain = disk_rel_path(row["path"])
+            for rel in (plain, _with_tag(plain, row["path"])):
+                if rel in claimed or (on_disk is not None and rel not in on_disk):
                     continue
                 try:
                     verify_saved_file(root, rel, expected_size=row["size"], min_size=0)
@@ -2574,6 +2592,13 @@ class FileDownloader:
         self.session = {"done": 0, "failed": 0, "bytes": 0, "started": None}
         self.message = ""
         self.opener = build_opener()
+        self._snap = None           # счётчики для статуса: пока свежие, по базе заново не считаем
+        self._dry_until = 0.0       # до этого времени (monotonic) не искать файлы в очередь: прошлый поиск их не нашёл
+
+    def invalidate(self):
+        """Поменялись папка, настройки или статусы файлов: счётчики для статуса — заново, поиск файлов — сразу."""
+        self._snap = None
+        self._dry_until = 0.0
 
     def scope_sql(self):
         parts = [subtree_sql(self.scope)] + [f"NOT {subtree_sql(x)}" for x in self.exclude]
@@ -2633,6 +2658,7 @@ class FileDownloader:
         self.scope, self.exclude = folder, skip
         set_setting("fl_scope", folder)
         set_setting("fl_exclude", json.dumps(skip, ensure_ascii=False))
+        self.invalidate()
         return folder, None
 
     @staticmethod
@@ -2660,6 +2686,7 @@ class FileDownloader:
         if "include_media" in body:
             self.include_media = bool(body["include_media"])
             set_setting("fl_include_media", "1" if self.include_media else "0")
+            self.invalidate()
         return {"threads": self.threads, "include_media": self.include_media}, errors
 
     # ---------- управление
@@ -2677,12 +2704,13 @@ class FileDownloader:
             if self._alive():
                 return {"ok": False, "error": "уже запущено" if not self.stop_event.is_set() else "ещё останавливается, подожди"}
             a = auth_summary()
-            if not a["cookies"] or not a["has_sk"]:
+            if (not a["cookies"] or not a["has_sk"]) and not self.scope.startswith("/public/"):
                 return {"ok": False, "error": "нет данных авторизации: открой Яндекс Диск во вкладке браузера "
                                               "(перехват передаст куки и sk), потом повтори"}
             self.stop_event.clear()
             self.finishing.clear()
             self.message = ""
+            self.invalidate()
             self.workers = {}
             with self.alock:
                 self.active = {}
@@ -2698,29 +2726,37 @@ class FileDownloader:
 
     def retry_failed(self):
         with dbc() as c:
-            return c.execute("UPDATE files SET fl_status=NULL, fl_error=NULL "
-                             f"WHERE fl_status='failed' AND {self.scope_sql()}").rowcount
+            n = c.execute("UPDATE files SET fl_status=NULL, fl_error=NULL "
+                          f"WHERE fl_status='failed' AND {self.scope_sql()}").rowcount
+        self.invalidate()
+        return n
 
     # ---------- менеджер
 
     def refill(self):
+        """Дополнить очередь, когда в ней осталось не больше половины. Поиск следующих файлов — проход по базе, а в ней
+        бывают сотни тысяч строк (общая папка по ссылке): не после каждого файла и не каждые полсекунды."""
         with self.refill_lock:
+            if time.monotonic() < self._dry_until:
+                return
             with dbc() as c:
                 have = c.execute("SELECT COUNT(*) FROM files WHERE fl_status='queued'").fetchone()[0]
                 need = FL_QUEUE_SIZE - have
-                if need <= 0:
+                if have > FL_QUEUE_SIZE // 2:
                     return
                 rows = c.execute(f"SELECT path FROM files WHERE {self.eligible()} {FL_ORDER} LIMIT ?", (need,)).fetchall()
+                if len(rows) < need:
+                    self._dry_until = time.monotonic() + FL_DRY_RETRY
                 if rows:
                     ts = now_iso()
                     c.executemany("UPDATE files SET fl_status='queued', fl_at=? WHERE path=?", [(ts, r[0]) for r in rows])
 
     def _finished(self):
+        """Очередь пуста, ничего не качается и качать больше нечего. Пока что-то в очереди — без прохода по базе."""
         with dbc() as c:
-            r = c.execute(
-                "SELECT COALESCE(SUM(fl_status='queued'),0), COALESCE(SUM(fl_status='downloading'),0), "
-                f"COALESCE(SUM({self.eligible()}),0) FROM files").fetchone()
-        return not any(r)
+            if c.execute("SELECT 1 FROM files WHERE fl_status IN ('queued','downloading') LIMIT 1").fetchone():
+                return False
+            return not c.execute(f"SELECT 1 FROM files WHERE {self.eligible()} LIMIT 1").fetchone()
 
     def _ensure_workers(self):
         for idx in range(self.threads):
@@ -3097,7 +3133,15 @@ class FileDownloader:
 
     # ---------- статус для страницы
 
-    def snapshot(self):
+    def _db_snapshot(self):
+        """Счётчики и списки для статуса — подсчёт по базе. В огромной базе (общая папка по ссылке) это доли секунды,
+        а статус спрашивают каждую секунду: пока не поменялись состояние загрузки, обхода и выбор папки, прошлый
+        подсчёт отдаём FL_SNAPSHOT_TTL секунд (или вчетверо дольше, чем он занял)."""
+        key = (self.scope, tuple(self.exclude), self.include_media, self.state(), CRAWL.run)
+        snap = self._snap
+        if snap and snap["key"] == key and time.monotonic() < snap["until"]:
+            return snap["data"]
+        t = time.monotonic()
         elig = self.eligible()
         scope = self.scope_sql()
         with dbc() as c:
@@ -3131,8 +3175,16 @@ class FileDownloader:
                 for x in c.execute("SELECT path,fl_error,fl_at FROM files WHERE fl_status='failed' "
                                    f"AND {scope} ORDER BY fl_at DESC, path DESC LIMIT 25")]
             unopened = [x[0] for x in c.execute(
-                f"SELECT path FROM files WHERE kind='dir' AND listed_at IS NULL AND {scope} ORDER BY path LIMIT 30")]
+                f"SELECT path FROM files WHERE kind='dir' AND listed_at IS NULL AND {scope} ORDER BY path LIMIT 30")
+            ] if counts["dirs_unopened"] else []
+        data = {"counts": counts, "queue": queue, "recent_done": recent_done, "recent_failed": recent_failed,
+                "unopened": unopened}
+        took = time.monotonic() - t
+        self._snap = {"key": key, "until": time.monotonic() + max(FL_SNAPSHOT_TTL, 4 * took), "data": data}
+        return data
 
+    def snapshot(self):
+        db = self._db_snapshot()
         now = time.monotonic()
         try:
             while self.window and now - self.window[0][0] > 10:
@@ -3161,12 +3213,12 @@ class FileDownloader:
             "speed": speed,
             "auth": auth_summary(),
             "session": dict(self.session),
-            "counts": counts,
+            "counts": db["counts"],
             "active": active,
-            "queue": queue,
-            "recent_done": recent_done,
-            "recent_failed": recent_failed,
-            "unopened": unopened,
+            "queue": db["queue"],
+            "recent_done": db["recent_done"],
+            "recent_failed": db["recent_failed"],
+            "unopened": db["unopened"],
             "crawl": CRAWL.snapshot(),
         }
 
@@ -3417,6 +3469,7 @@ def ingest_public(pid, key, name, files, listed, single=False):
                       "VALUES(?,?,?,'dir',?,?,?,?) ON CONFLICT(path) DO UPDATE SET "
                       "listed_at=COALESCE(files.listed_at, excluded.listed_at), crawled_at=excluded.crawled_at",
                       (d, parent_of(d), root["name"] if d == base else name_from_path(d), ts, ts, ts, ts))
+    FL.invalidate()
     return n
 
 
