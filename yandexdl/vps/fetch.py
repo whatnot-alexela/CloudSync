@@ -14,7 +14,7 @@
 Если программа посреди работы перезапустилась, обход и скачивание продолжаются сами; зависла (6 минут не отвечает) —
 fetch перезапускает её и продолжает.
 
-Только stdlib. Запускает yandexdl-vps.sh fetch / status.
+Только stdlib. Запускает yandexdl-vps.sh fetch / status / errors.
 """
 import argparse
 import json
@@ -24,6 +24,7 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 API = os.environ.get("YDISK_API", "http://127.0.0.1:8001")
@@ -445,25 +446,63 @@ class Mover:
 REPORT_NAME = "_повреждённые_файлы.txt"
 
 
+def lost_bytes(note):
+    """«повреждён: потеряно 200000 из 5000000 байт …» -> 200000."""
+    try:
+        return int(note.split("потеряно ", 1)[1].split(" ", 1)[0])
+    except (AttributeError, IndexError, ValueError):
+        return 0
+
+
+def errors(folder=None):
+    """Что не скачалось и что скачалось с повреждениями — в папке, с которой работает программа, или в folder
+    (папка Диска или общая ссылка). Только читает: можно и во время загрузки."""
+    if not folder:
+        st = api("/api/fl/status")
+        r, title = api("/api/fl/damaged"), scope_title(st) + except_text(st)
+    else:
+        title, link = None, parse_public(folder)
+        if link:
+            import public
+            title = link[0] + ("" if link[1] == "/" else link[1])
+            folder = "/public/" + public.public_id(link[0]) + ("" if link[1] == "/" else link[1].rstrip("/"))
+        r = api("/api/fl/damaged?" + urllib.parse.urlencode({"folder": folder}), ok_codes=(200, 400))
+        if r.get("error"):
+            raise Fail(f"«{title or folder}»: {r['error']}")
+        title = title or (r["folder"] + (" (весь Диск)" if r["folder"] == "/disk" else ""))
+    root = r["folder"].rstrip("/") + "/"
+    failed = [x for x in r["items"] if x["fl_status"] == "failed"]
+    damaged = [x for x in r["items"] if x["fl_status"] == "done"]
+    print(f"Папка: {title}")
+    if not failed and not damaged:
+        print("Не скачанных и повреждённых файлов пока нет.")
+    if failed:
+        print(f"\nНЕ СКАЧАЛИСЬ — {len(failed)} (ещё раз попробовать — та же команда fetch с --retry-failed):")
+        for x in failed:
+            print(f"  {x['path'][len(root):]}  ({human(x['size'])})\n"
+                  f"      {(x['fl_error'] or '').rsplit('; ', 1)[-1][:160]}")
+    if damaged:
+        print(f"\nСКАЧАНЫ С ПОВРЕЖДЕНИЯМИ — {len(damaged)}, потеряно "
+              f"{human(sum(lost_bytes(x['fl_note']) for x in damaged))} (дыры заполнены нулями):")
+        for x in damaged:
+            print(f"  {x['path'][len(root):]}\n      {x['fl_note'][:160]}")
+
+
 def damage_report(st):
     """Список повреждённых (скачаны с дырами) и нечитаемых файлов — в файл рядом со скачанным
     (уедет в облако вместе с ними). Возвращает (повреждённых, потеряно байт, нечитаемых)."""
     items = api("/api/fl/damaged")["items"]
     damaged = [x for x in items if x["fl_status"] == "done"]
     failed = [x for x in items if x["fl_status"] == "failed"]
-    lost = 0
-    for x in damaged:
-        try:
-            lost += int(x["fl_note"].split("потеряно ", 1)[1].split(" ", 1)[0])
-        except (IndexError, ValueError):
-            pass
+    lost = sum(lost_bytes(x["fl_note"]) for x in damaged)
     if not items:
         return 0, 0, 0
     folder = local_folder(st)
     os.makedirs(folder, exist_ok=True)
     root = st["scope"].rstrip("/") + "/"
     with open(os.path.join(folder, REPORT_NAME), "w", encoding="utf-8") as f:
-        f.write(f"Папка на Диске: {st['scope']}\nСоставлено: {time.strftime('%Y-%m-%d %H:%M')}\n\n"
+        f.write(f"{'Общая папка' if st.get('public') else 'Папка на Диске'}: {scope_title(st)}\n"
+                f"Составлено: {time.strftime('%Y-%m-%d %H:%M')}\n\n"
                 "Файлы, повреждённые на стороне Яндекс Диска. Скачано всё, что читалось; нечитаемые места\n"
                 "заполнены нулями, смещения внутри файла сохранены (аудио обычно играется с паузами на месте дыр).\n\n")
         f.write(f"ПОВРЕЖДЕНЫ — {len(damaged)} файлов, потеряно {human(lost)}:\n")
@@ -502,9 +541,11 @@ def report(st, mover=None, dmg=(0, 0, 0)):
         print(f"                 " + (f"{rs['count']} файлов, {human(rs['bytes'])} ({rs['bytes']} байт)" if rs
                                       else "не удалось посчитать (rclone size)"))
     if c["failed"]:
-        print("Не скачались (последние):")
+        print("Не скачались (последние; все — yandexdl errors):")
+        root = st["scope"].rstrip("/") + "/"
         for x in st["recent_failed"][:15]:
-            print(f"  {x['path']}: {(x.get('error') or '')[:150]}")
+            print(f"  {x['path'][len(root):] if x['path'].startswith(root) else x['path']}: "
+                  f"{(x.get('error') or '')[:150]}")
     print("=" * 70)
 
 
@@ -667,6 +708,7 @@ def status():
     print(f"Скачивание: {st['state']}{' — ' + st['message'] if st.get('message') else ''}; "
           f"скачано {c['done']} ({human(c['done_bytes'])}), ошибок {c['failed']}, "
           f"осталось {c['remaining'] + c['queued'] + c['downloading']} ({human(c['remaining_bytes'])})")
+    print("Что не скачалось и что повреждено: yandexdl errors")
 
 
 def main():
@@ -675,6 +717,8 @@ def main():
     p.add_argument("--dest", default="/root/yandex")
     p.add_argument("--dump-dir")
     p.add_argument("--status", action="store_true")
+    p.add_argument("--errors", nargs="?", const="", metavar="ПАПКА",
+                   help="что не скачалось и что повреждено (в выбранной папке или в ПАПКЕ / по ссылке)")
     crawl_mode = p.add_mutually_exclusive_group()
     crawl_mode.add_argument("--no-crawl", action="store_true", help="не обходить папки, взять список, собранный раньше")
     crawl_mode.add_argument("--recrawl", action="store_true",
@@ -690,6 +734,9 @@ def main():
     try:
         if a.status:
             status()
+            return 0
+        if a.errors is not None:
+            errors(a.errors)
             return 0
         if not a.folder:
             p.error("--folder обязателен")

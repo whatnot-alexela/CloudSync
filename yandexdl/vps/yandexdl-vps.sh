@@ -13,6 +13,7 @@
 #        вместо папки — общая ссылка disk.yandex.ru/d/… (или на её подпапку): её файлы, список — без обхода
 #   bash yandexdl-vps.sh pick Папка         оставить в папке только выбранные подпапки и обойти их
 #   bash yandexdl-vps.sh status             что сейчас происходит
+#   bash yandexdl-vps.sh errors [Папка]     что не скачалось и что повреждено (можно во время загрузки)
 #   bash yandexdl-vps.sh diagnose           в каком виде Диск отдаёт списки папок (если файлов 0)
 #   bash yandexdl-vps.sh start|stop|restart|logs
 set -euo pipefail
@@ -347,6 +348,11 @@ cmd_pick() {
 
 cmd_diagnose() { "$VENV/bin/python" -u "$APP_DIR/vps/diagnose.py" "$DUMP_DIR"; }
 
+cmd_errors() {
+  wait_api 5 || die "программа не отвечает — посмотри yandexdl status"
+  "$VENV/bin/python" -u "$APP_DIR/vps/fetch.py" --errors "$@"
+}
+
 cmd_logs() { journalctl -u yandexdl-app -o cat --no-pager -n "${1:-80}" | grep -v '"GET /api/' || true; }
 
 case "${1:-}" in
@@ -362,5 +368,6 @@ case "${1:-}" in
   pick)     shift; cmd_pick "$@" ;;
   diagnose) cmd_diagnose ;;
   logs)     shift; cmd_logs "$@" ;;
-  *) sed -n '2,17p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 1 ;;
+  errors)   shift; cmd_errors "$@" ;;
+  *) sed -n '2,18p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac

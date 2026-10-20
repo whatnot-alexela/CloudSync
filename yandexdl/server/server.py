@@ -3493,13 +3493,22 @@ def api_fl_public():
 
 @app.get("/api/fl/damaged")
 def api_fl_damaged():
-    """Повреждённые (скачаны с дырами) и нечитаемые файлы в выбранной папке — для отчёта."""
+    """Повреждённые (скачаны с дырами) и нечитаемые файлы в выбранной папке — для отчёта; ?folder= — в другой папке
+    (целиком, без исключений). Только читает базу: можно и во время загрузки."""
+    folder, where = FL.scope, FL.scope_sql()
+    if request.args.get("folder"):
+        folder, err = FL._folder(request.args["folder"])
+        if err:
+            return jsonify(error=err), 400
+        where = subtree_sql(folder)
     with dbc() as c:
+        if request.args.get("folder") and not c.execute("SELECT 1 FROM files WHERE path=?", (folder,)).fetchone():
+            return jsonify(error=f"папки «{folder}» программа не видела — проверь название"), 400
         rows = c.execute(
-            "SELECT path, size, fl_status, fl_note, fl_error, fl_file FROM files WHERE kind='file' AND "
-            f"{FL.scope_sql()} AND ((fl_status='done' AND fl_note LIKE 'повреждён%') OR fl_status='failed') "
+            "SELECT path, size, fl_status, fl_note, fl_error, fl_file FROM files WHERE fl_status IN ('done','failed') "
+            f"AND kind='file' AND {where} AND (fl_status='failed' OR fl_note LIKE 'повреждён%') "
             "ORDER BY path").fetchall()
-    return jsonify(items=[dict(r) for r in rows])
+    return jsonify(folder=folder, items=[dict(r) for r in rows])
 
 
 @app.get("/api/fl/crawl")
