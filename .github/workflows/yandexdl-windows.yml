@@ -10,7 +10,7 @@ on:
   workflow_dispatch:
   push:
     branches:
-      - ccr-8e6ccce9-yrk9w7
+      - main
     paths:
       - "yandexdl/**"
       - ".github/workflows/yandexdl-windows.yml"

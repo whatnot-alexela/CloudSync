@@ -113,10 +113,10 @@ ffmpeg по-прежнему нужен отдельно, в PATH (для вид
 (`127.0.0.1:8001`) и не прерываются, если закрыть SSH.
 
 ```bash
-# с своего компьютера: скопировать папку yandexdl/ на сервер
-scp -r yandexdl root@СЕРВЕР:/root/
-# на сервере
-bash /root/yandexdl/vps/yandexdl-vps.sh install   # пакеты, venv, Qt WebEngine, Xvfb, x11vnc, noVNC, службы
+# на сервере: код из GitHub (репозиторий закрытый — сначала gh auth login)
+gh repo clone whatnot-alexela/CloudSync /root/cloudsync
+bash /root/cloudsync/yandexdl/vps/yandexdl-vps.sh install   # пакеты, venv, Qt WebEngine, Xvfb, x11vnc, noVNC, службы
+# (или без GitHub: scp -r yandexdl root@СЕРВЕР:/root/ и bash /root/yandexdl/vps/yandexdl-vps.sh install)
 yandexdl vnc                # ссылка https://СЕРВЕР:6080/… и одноразовый пароль; войти в Яндекс во вкладке Диска
 yandexdl vnc-off            # после входа: noVNC выключается, пароль стирается, порт закрывается
 yandexdl fetch Творчество   # выбрать папку, «качать и фото/видео из папок», обход, скачивание, отчёт
@@ -131,6 +131,12 @@ yandexdl update             # после git pull / scp новой версии:
 (`systemctl stop yandexdl-fetch`), после обновления повтори ту же команду `fetch` — она продолжит. Если код в папке
 не совпадает с установленным, `fetch` не запускается и пишет, что сделать. Установленная версия (коммит) видна
 в `yandexdl status` и в первой строке лога `fetch`; там же `status` показывает, чем закончился последний `fetch`.
+
+**Переезд из DeadCat.** Раньше код лежал в репозитории whatnot-alexela/DeadCat, и сервер мог ставиться из его клона
+(например, `/root/yandexdl-src`). Чтобы `yandexdl update` брал код отсюда: останови задание, склонируй CloudSync
+(команда выше) и один раз выполни `install` из нового клона — он запомнит эту папку. База, вход в Яндекс, настройки
+и скачанное лежат отдельно (`/var/lib/yandexdl`, `/root/yandex`) и при этом не трогаются; потом повтори ту же
+команду `fetch` — она продолжит. Старый клон после этого можно удалить.
 
 Файлы ложатся в `/root/yandex/Диск/<папка>` (`--dest` — другая папка). Параметры `fetch`:
 `--threads 1` — качать по одному файлу; `--no-crawl` — не обходить папки, взять список, собранный
