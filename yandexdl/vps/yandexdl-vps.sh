@@ -14,6 +14,8 @@
 #   bash yandexdl-vps.sh pick Папка         оставить в папке только выбранные подпапки и обойти их
 #   bash yandexdl-vps.sh status             что сейчас происходит
 #   bash yandexdl-vps.sh errors [Папка]     что не скачалось и что повреждено (можно во время загрузки)
+#   bash yandexdl-vps.sh compare Ссылка Папка [--merge Куда Откуда]   сверить общую папку со своей копией на Диске:
+#                                           что докачать из своей, потом склеить лучшее (см. README)
 #   bash yandexdl-vps.sh diagnose           в каком виде Диск отдаёт списки папок (если файлов 0)
 #   bash yandexdl-vps.sh start|stop|restart|logs
 set -euo pipefail
@@ -348,6 +350,28 @@ cmd_pick() {
 
 cmd_diagnose() { "$VENV/bin/python" -u "$APP_DIR/vps/diagnose.py" "$DUMP_DIR"; }
 
+cmd_compare() {
+  need_root
+  [ $# -ge 2 ] || die "нужны общая ссылка и своя папка: yandexdl compare \"https://disk.yandex.ru/d/…\" \"Загрузки/Папка\" [--merge gdrive:Куда gdrive:Откуда]"
+  [ -f "$APP_DIR/vps/compare.py" ] || die "установлена старая версия без сверки — сначала yandexdl update"
+  if [[ " $* " != *" --merge "* ]]; then
+    "$VENV/bin/python" -u "$APP_DIR/vps/compare.py" "$@"
+    return
+  fi
+  # склейка долгая (файлы гоняются через облако) — в фоне, как fetch
+  systemctl is-active -q yandexdl-fetch && die "сначала дождись конца загрузки (или останови её: systemctl stop yandexdl-fetch)"
+  systemctl is-active -q yandexdl-merge && die "сверка уже идёт — смотреть: journalctl -u yandexdl-merge -f -o cat"
+  systemctl reset-failed yandexdl-merge.service 2>/dev/null || true
+  systemd-run -q --unit=yandexdl-merge --collect --setenv=HOME=/root "$VENV/bin/python" -u "$APP_DIR/vps/compare.py" "$@"
+  echo "Сверка идёт в фоне (служба yandexdl-merge) — можно закрыть SSH. Снова смотреть: journalctl -u yandexdl-merge -f -o cat"
+  echo
+  journalctl -u yandexdl-merge -f -o cat --since "-5s" &
+  local jpid=$!
+  trap 'kill $jpid 2>/dev/null; exit 0' INT
+  while systemctl is-active -q yandexdl-merge; do sleep 2; done
+  sleep 1; kill $jpid 2>/dev/null || true
+}
+
 cmd_errors() {
   wait_api 3 15 || die "программа не отвечает — посмотри yandexdl status"
   "$VENV/bin/python" -u "$APP_DIR/vps/fetch.py" --errors "$@"
@@ -369,5 +393,6 @@ case "${1:-}" in
   diagnose) cmd_diagnose ;;
   logs)     shift; cmd_logs "$@" ;;
   errors)   shift; cmd_errors "$@" ;;
-  *) sed -n '2,18p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 1 ;;
+  compare)  shift; cmd_compare "$@" ;;
+  *) sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac
