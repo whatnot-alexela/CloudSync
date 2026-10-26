@@ -2594,6 +2594,7 @@ class FileDownloader:
         self.opener = build_opener()
         self._snap = None           # счётчики для статуса: пока свежие, по базе заново не считаем
         self._dry_until = 0.0       # до этого времени (monotonic) не искать файлы в очередь: прошлый поиск их не нашёл
+        self._snap_lock = threading.Lock()   # счётчики для статуса пересчитывает один поток за раз
 
     def invalidate(self):
         """Поменялись папка, настройки или статусы файлов: счётчики для статуса — заново, поиск файлов — сразу."""
@@ -3141,6 +3142,20 @@ class FileDownloader:
         snap = self._snap
         if snap and snap["key"] == key and time.monotonic() < snap["until"]:
             return snap["data"]
+        # Пересчитывает один поток. Остальные, пока он считает, получают прошлый подсчёт (если он для того же
+        # состояния): иначе одновременные запросы считают каждый сам и на слабом сервере отвечают по нескольку секунд.
+        same = bool(snap) and snap["key"] == key
+        if not self._snap_lock.acquire(blocking=not same):
+            return snap["data"]
+        try:
+            snap = self._snap
+            if snap and snap["key"] == key and time.monotonic() < snap["until"]:
+                return snap["data"]
+            return self._db_count(key)
+        finally:
+            self._snap_lock.release()
+
+    def _db_count(self, key):
         t = time.monotonic()
         elig = self.eligible()
         scope = self.scope_sql()

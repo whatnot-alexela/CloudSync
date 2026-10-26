@@ -275,12 +275,22 @@ def download_round(mover=None):
             continue
         if time.time() - last_print > 30:
             last_print = time.time()
-            eta = ""
-            if st["speed"] > 0 and c["remaining_bytes"]:
-                eta = f", осталось ~{int(c['remaining_bytes'] / st['speed'] / 60) + 1} мин"
+            # Срок — по средней скорости с начала этого захода (с паузы на перенос), а не по последним 10 секундам:
+            # на повреждённых файлах мгновенная скорость скачет от нуля до мегабайтов, и срок вместе с ней.
+            sess = st.get("session") or {}
+            took = time.time() - (sess.get("started") or time.time())
+            avg = sess.get("bytes", 0) / took if took > 60 and sess.get("bytes") else st["speed"]
+            eta = f", осталось ~{eta_text(c['remaining_bytes'] / avg)}" if avg > 0 and c["remaining_bytes"] else ""
             log(f"скачано {c['done']} ({human(c['done_bytes'])}), ошибок {c['failed']}, "
                 f"осталось {c['remaining'] + c['queued'] + c['downloading']} ({human(c['remaining_bytes'])}), "
                 f"скорость {human(st['speed'])}/с{eta}")
+
+
+def eta_text(sec):
+    """1234567 -> «14 дн 6 ч», 5000 -> «1 ч 24 мин», 300 -> «5 мин»."""
+    m = int(sec // 60) + 1
+    d, h = m // 1440, m % 1440 // 60
+    return f"{d} дн {h} ч" if d else f"{h} ч {m % 60} мин" if h else f"{m} мин"
 
 
 def free_bytes(path):

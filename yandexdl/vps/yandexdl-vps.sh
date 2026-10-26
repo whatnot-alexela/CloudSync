@@ -46,9 +46,9 @@ public_ip() {
 # первый пакет из списка, который есть в репозитории (libasound2t64 на Ubuntu 24.04, libasound2 раньше)
 pick() { local p; for p in "$@"; do apt-cache show "$p" >/dev/null 2>&1 && { echo "$p"; return; }; done; }
 
-wait_api() {
+wait_api() {     # [попыток] [сек на ответ]: занятая программа отвечает не сразу
   for _ in $(seq 1 "${1:-90}"); do
-    curl -fsS -m 2 "$API/api/fl/status" >/dev/null 2>&1 && return 0
+    curl -fsS -m "${2:-2}" "$API/api/fl/status" >/dev/null 2>&1 && return 0
     sleep 1
   done
   return 1
@@ -229,7 +229,7 @@ cmd_update() {
 cmd_start() {
   need_root
   systemctl restart yandexdl-xvfb yandexdl-app
-  wait_api 120 || { journalctl -u yandexdl-app -n 40 --no-pager; die "программа не поднялась (лог выше)"; }
+  wait_api 120 10 || { journalctl -u yandexdl-app -n 40 --no-pager; die "программа не поднялась (лог выше)"; }
   echo "Программа работает, API: $API"
 }
 
@@ -294,7 +294,7 @@ cmd_fetch() {
     die "код в $src не совпадает с установленным в $APP_DIR, а работает установленный — после git pull или scp его нужно поставить: yandexdl update (или bash $src/vps/yandexdl-vps.sh install), потом повтори fetch"
   fi
   systemctl is-active -q yandexdl-app || cmd_start
-  wait_api 60 || die "API программы не отвечает"
+  wait_api 60 10 || die "API программы не отвечает"
   systemctl reset-failed yandexdl-fetch.service 2>/dev/null || true
   # HOME — чтобы rclone нашёл свой конфиг (/root/.config/rclone/rclone.conf)
   systemd-run -q --unit=yandexdl-fetch --collect --setenv=HOME=/root \
@@ -315,10 +315,10 @@ mem_text() {     # «доступно памяти 95 из 1987 МБ, подка
 }
 
 cmd_status() {
-  if wait_api 5; then
+  if wait_api 3 15; then
     "$VENV/bin/python" -u "$APP_DIR/vps/fetch.py" --status
   elif systemctl is-active -q yandexdl-app; then
-    echo "(!) Программа запущена, но не отвечает: только что запускается, сильно занята или зависла ($(mem_text))."
+    echo "(!) Программа запущена, но не ответила и за 15 секунд: только что запускается, сильно занята или зависла ($(mem_text))."
     if systemctl is-active -q yandexdl-fetch; then
       echo "    Задание fetch ждёт её само, а после 6 минут молчания перезапускает."
     else
@@ -341,7 +341,7 @@ cmd_status() {
 }
 
 cmd_pick() {
-  wait_api 5 || die "программа не запущена: yandexdl start"
+  wait_api 3 15 || die "программа не отвечает — посмотри yandexdl status"
   systemctl is-active -q yandexdl-fetch && die "сначала останови загрузку: systemctl stop yandexdl-fetch"
   "$VENV/bin/python" -u "$APP_DIR/vps/pick.py" "$@"
 }
@@ -349,7 +349,7 @@ cmd_pick() {
 cmd_diagnose() { "$VENV/bin/python" -u "$APP_DIR/vps/diagnose.py" "$DUMP_DIR"; }
 
 cmd_errors() {
-  wait_api 5 || die "программа не отвечает — посмотри yandexdl status"
+  wait_api 3 15 || die "программа не отвечает — посмотри yandexdl status"
   "$VENV/bin/python" -u "$APP_DIR/vps/fetch.py" --errors "$@"
 }
 
