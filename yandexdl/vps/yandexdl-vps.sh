@@ -14,7 +14,7 @@
 #   bash yandexdl-vps.sh pick Папка         оставить в папке только выбранные подпапки и обойти их
 #   bash yandexdl-vps.sh status             что сейчас происходит
 #   bash yandexdl-vps.sh errors [Папка]     что не скачалось и что повреждено (можно во время загрузки)
-#   bash yandexdl-vps.sh compare Ссылка Папка [--merge Куда Откуда]   сверить общую папку со своей копией на Диске:
+#   bash yandexdl-vps.sh compare Ссылка Папка [--merge Куда Откуда [--partial]]   сверить общую папку со своей копией:
 #                                           что докачать из своей, потом склеить лучшее (см. README)
 #   bash yandexdl-vps.sh diagnose           в каком виде Диск отдаёт списки папок (если файлов 0)
 #   bash yandexdl-vps.sh start|stop|restart|logs

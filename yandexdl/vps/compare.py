@@ -22,6 +22,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import unquote, urlparse
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -215,83 +216,171 @@ def report(link, own_root, pub, own, bad):
     return cats
 
 
-def do_merge(db, key, pid, own_root, to, frm, pub, own, bad):
+def rclone_try(*args):
+    """rclone без исключения: (код выхода, stdout). Для пачек, где часть файлов может не пройти."""
+    r = subprocess.run(["rclone", *args], capture_output=True, text=True)
+    return r.returncode, r.stdout
+
+
+def cloud_md5s(root, rels):
+    """md5 файлов root/rel из облака одним вызовом rclone: {rel: md5}."""
+    if not rels:
+        return {}
+    lst = os.path.join(WORK, "список.txt")
+    with open(lst, "w", encoding="utf-8") as f:
+        f.write("\n".join(rels) + "\n")
+    _, out = rclone_try("md5sum", root, "--files-from-raw", lst, "--checkers", "16")
+    res = {}
+    for line in out.splitlines():
+        h, _, rel = line.partition("  ")
+        if len(h) == 32 and rel:
+            res[rel] = h
+    return res
+
+
+def originals(key, rels):
+    """md5 оригиналов из открытого API Диска — по 6 запросов сразу: {rel: md5 или None}."""
+    res, t = {}, time.time()
+    with ThreadPoolExecutor(6) as ex:
+        for n, (rel, h) in enumerate(zip(rels, ex.map(lambda r: original_md5(key, r), rels)), 1):
+            res[rel] = h
+            if time.time() - t > 60:
+                t = time.time()
+                log(f"md5 оригиналов: {n} из {len(rels)}")
+    return res
+
+
+def mark(db, pid, rel, tail, size, note):
+    db.execute("UPDATE files SET fl_status='done', fl_note=?, fl_error=NULL, fl_bytes=?, fl_file=?, fl_at=? WHERE path=?",
+               (note, size, f"Ссылки/{pid}/{tail}", time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime()),
+                f"/public/{pid}{rel}"))
+
+
+def do_merge(db, key, pid, own_root, to, frm, pub, own, bad, partial=False):
+    """Лучшая версия каждого плохого файла общей копии — в облако общей копии. Целые файлы своей копии копируются
+    пачкой (внутри облака, одним вызовом rclone), md5 берутся списком; склейка двух повреждённых — по одному файлу."""
     os.makedirs(WORK, exist_ok=True)
     own_rel = own_root[len("/disk/"):]
-    lines, done = [], {"restored": 0, "copied": 0, "better": 0, "same": 0, "skip": 0}
-    a, b, m = (os.path.join(WORK, x) for x in ("общая", "своя", "склейка"))
-    for n, rel in enumerate(bad, 1):
+    unknown = [rel for rel in bad if rel not in own]
+    waiting = [rel for rel in bad if rel in own and kind(*own[rel][:2]) == "pending"]
+    if unknown and not partial:
+        raise Fail(f"{len(unknown)} нужных файлов твоей копии программа не знает — сначала сверка без --merge: "
+                   f'yandexdl compare "{key}" "{own_rel}"')
+    if waiting and not partial:
+        raise Fail(f"из твоей копии ещё не скачано {len(waiting)} нужных файлов: загрузка не закончена или прервалась "
+                   f"(в yandexdl status — «осталось …»). Сначала докачай: yandexdl fetch \"{own_rel}\" --no-crawl "
+                   f"--rclone {frm} --part-gb 2. Склеить уже скачанное сейчас, а остальное потом — добавь --partial")
+    lines, done = [], {"restored": 0, "copied": 0, "better": 0, "same": 0, "skip": 0, "nowhere": 0, "fail": 0}
+    copies, merges = [], []
+    for rel in bad:
         p, o = pub[rel], own.get(rel)
-        pk, ok_ = kind(*p[:2]), (kind(*o[:2]) if o else "missing")
-        if ok_ in ("missing", "pending") or not (o and o[3]):
-            done["skip"] += 1
-            continue
+        ok_ = kind(*o[:2]) if o else "missing"
         if ok_ == "failed":
             lines.append(f"не читается нигде: {rel}")
-            done["skip"] += 1
+            done["nowhere"] += 1
             continue
-        src = remote_join(frm, o[3].split("/", 1)[1])                      # fl_file: «Диск/<путь на Диске>»
-        tail = p[3].split("/", 2)[2] if p[3] else o[3].split("/", 1)[1][len(own_rel) + 1:]
-        dst = remote_join(to, tail)
-        size = p[2] or 0
-        note = None
-        if ok_ == "ok":
-            want, got = original_md5(key, rel), cloud_md5(src)
-            if want and got and want != got and pk == "damaged":
-                lines.append(f"у тебя другая версия (md5 не как у оригинала), не трогаю: {rel}")
-                done["skip"] += 1
-                continue
-            rclone("copyto", src, dst)
-            note = "взят целым с твоего Диска" + (" (md5 совпал с оригиналом)" if want and want == got else
-                                                   " (md5 не как у оригинала — возможно, другая версия)" if want and got
-                                                   else "")
-            done["copied"] += 1
-        elif pk == "failed":                                                # общая не читается, своя с дырами
-            rclone("copyto", src, dst)
-            note = f"повреждён: потеряно {lost_of(o[1])} из {size} байт — взят с твоего Диска, общая копия не читалась"
-            done["copied"] += 1
-        else:                                                               # обе с дырами — склеить
-            if (o[2] or 0) != size:
-                lines.append(f"копии разного размера ({o[2]} и {size} байт), не склеиваю: {rel}")
-                done["skip"] += 1
-                continue
-            free = shutil.disk_usage(WORK).free
-            if free < 3 * size + 2 * 1024 ** 3:
-                raise Fail(f"для склейки «{rel}» ({human(size)}) мало места на сервере: свободно {human(free)}")
-            try:
-                rclone("copyto", dst, a)
-                rclone("copyto", src, b)
-                got, conflicts = merge(a, b, m)
-                if conflicts:
-                    lines.append(f"копии различаются в {conflicts} местах — разные версии, не склеиваю: {rel}")
+        if ok_ in ("missing", "pending") or not o[3]:
+            continue
+        src_tail = o[3].split("/", 1)[1]                                     # fl_file: «Диск/<путь на Диске>»
+        tail = p[3].split("/", 2)[2] if p[3] else src_tail[len(own_rel) + 1:]
+        item = (rel, src_tail, tail, p[2] or 0, o)
+        (copies if ok_ == "ok" or kind(*p[:2]) == "failed" else merges).append(item)
+    log(f"к сверке: взять с твоего Диска {len(copies)}, склеить {len(merges)}, не читается нигде {done['nowhere']}"
+        + (f"; ещё не скачано из твоей копии {len(waiting) + len(unknown)} — сверю в следующий раз" if waiting or unknown
+           else ""))
+
+    # --- целые (или единственные) копии со своего Диска: md5 списком, копирование пачкой
+    src_root = remote_join(frm, own_rel)
+    if copies:
+        whole = [c for c in copies if kind(*c[4][:2]) == "ok"]
+        want = originals(key, [c[0] for c in whole])
+        rel_of = {c[0]: c[1][len(own_rel) + 1:] for c in copies if c[1].startswith(own_rel + "/")}
+        got = cloud_md5s(src_root, list(rel_of.values()))
+        ready = []
+        for rel, src_tail, tail, size, o in copies:
+            g, w = got.get(rel_of.get(rel)), want.get(rel)
+            if kind(*o[:2]) == "ok":
+                if w and g and w != g and kind(*pub[rel][:2]) == "damaged":
+                    lines.append(f"у тебя другая версия (md5 не как у оригинала), не трогаю: {rel}")
                     done["skip"] += 1
                     continue
-                want = original_md5(key, rel)
-                before, after = zero_blocks(a), zero_blocks(m)
-                if want and got == want:
-                    note = "восстановлен: склеен из двух повреждённых копий, md5 совпал с оригиналом"
-                    done["restored"] += 1
-                elif after < before:
-                    note = (f"повреждён: потеряно {after * BLOCK} из {size} байт (примерно) — склеен из двух копий, "
-                            f"было около {before * BLOCK}")
-                    done["better"] += 1
-                else:
-                    lines.append(f"склейка ничего не дала — дыры в одних и тех же местах: {rel}")
-                    done["same"] += 1
-                    continue
-                rclone("copyto", m, dst)
-            finally:
-                for x in (a, b, m):
-                    if os.path.exists(x):
-                        os.remove(x)
-        lines.append(f"{note}: {rel}")
-        db.execute("UPDATE files SET fl_status='done', fl_note=?, fl_error=NULL, fl_bytes=?, fl_file=?, fl_at=? "
-                   "WHERE path=?", (note, size, f"Ссылки/{pid}/{tail}", time.strftime("%Y-%m-%dT%H:%M:%S+00:00",
-                                                                                   time.gmtime()), f"/public/{pid}{rel}"))
+                note = "взят целым с твоего Диска" + (" (md5 совпал с оригиналом)" if w and w == g else
+                                                       " (md5 не как у оригинала — возможно, другая версия)" if w and g
+                                                       else "")
+            else:
+                note = (f"повреждён: потеряно {lost_of(o[1])} из {size} байт — взят с твоего Диска, "
+                        "общая копия не читалась")
+            ready.append((rel, src_tail, tail, size, note, g))
+        batch = [r for r in ready if rel_of.get(r[0]) == r[2]]               # тот же путь в обоих облаках
+        in_batch = {r[0] for r in batch}
+        log(f"копирую с твоего Диска {len(ready)} файлов (внутри облака)…")
+        if batch:
+            lst = os.path.join(WORK, "список.txt")
+            with open(lst, "w", encoding="utf-8") as f:
+                f.write("\n".join(r[2] for r in batch) + "\n")
+            rclone_try("copy", src_root, to, "--files-from-raw", lst, "--ignore-times", "--transfers", "8",
+                       "--checkers", "16")
+        for r in ready:
+            if r[0] not in in_batch:
+                rclone_try("copyto", remote_join(frm, r[1]), remote_join(to, r[2]))
+        landed = cloud_md5s(to.rstrip("/") if not to.endswith(":") else to, [r[2] for r in ready])
+        for rel, src_tail, tail, size, note, g in ready:
+            if g and landed.get(tail) == g:                                 # на месте и тот самый файл
+                mark(db, pid, rel, tail, size, note)
+                lines.append(f"{note}: {rel}")
+                done["copied"] += 1
+            else:
+                lines.append(f"не скопировалось — повтори --merge: {rel}")
+                done["fail"] += 1
         db.commit()
-        if n % 50 == 0:
-            log(f"сверено {n} из {len(bad)}: восстановлено {done['restored']}, взято с твоего Диска {done['copied']}, "
-                f"дыр стало меньше {done['better']}")
+        log(f"взято с твоего Диска {done['copied']}" + (f", не скопировалось {done['fail']}" if done["fail"] else ""))
+
+    # --- обе копии с дырами: скачать обе, склеить, проверить по md5 оригинала
+    a, b, m = (os.path.join(WORK, x) for x in ("общая", "своя", "склейка"))
+    t = time.time()
+    for n, (rel, src_tail, tail, size, o) in enumerate(merges, 1):
+        if (o[2] or 0) != size:
+            lines.append(f"копии разного размера ({o[2]} и {size} байт), не склеиваю: {rel}")
+            done["skip"] += 1
+            continue
+        free = shutil.disk_usage(WORK).free
+        if free < 3 * size + 2 * 1024 ** 3:
+            raise Fail(f"для склейки «{rel}» ({human(size)}) мало места на сервере: свободно {human(free)}")
+        dst = remote_join(to, tail)
+        try:
+            rclone("copyto", dst, a)
+            rclone("copyto", remote_join(frm, src_tail), b)
+            got, conflicts = merge(a, b, m)
+            if conflicts:
+                lines.append(f"копии различаются в {conflicts} местах — разные версии, не склеиваю: {rel}")
+                done["skip"] += 1
+                continue
+            want = original_md5(key, rel)
+            before, after = zero_blocks(a), zero_blocks(m)
+            if want and got == want:
+                note = "восстановлен: склеен из двух повреждённых копий, md5 совпал с оригиналом"
+                done["restored"] += 1
+            elif after < before:
+                note = (f"повреждён: потеряно {after * BLOCK} из {size} байт (примерно) — склеен из двух копий, "
+                        f"было около {before * BLOCK}")
+                done["better"] += 1
+            else:
+                lines.append(f"склейка ничего не дала — дыры в одних и тех же местах: {rel}")
+                done["same"] += 1
+                continue
+            rclone("copyto", m, dst)
+        finally:
+            for x in (a, b, m):
+                if os.path.exists(x):
+                    os.remove(x)
+        mark(db, pid, rel, tail, size, note)
+        db.commit()
+        lines.append(f"{note}: {rel}")
+        if time.time() - t > 60 or n == len(merges):
+            t = time.time()
+            log(f"склеено {n} из {len(merges)}: восстановлено {done['restored']}, дыр стало меньше {done['better']}, "
+                f"не помогло {done['same']}")
+
     path = os.path.join(WORK, REPORT_NAME)
     with open(path, "w", encoding="utf-8") as f:
         f.write(f"Сверка общей копии с твоей ({own_root}), {time.strftime('%Y-%m-%d %H:%M')}\n\n" + "\n".join(lines) + "\n")
@@ -301,7 +390,12 @@ def do_merge(db, key, pid, own_root, to, frm, pub, own, bad):
     print(f"Взято с твоего Диска:                        {done['copied']}")
     print(f"Склеено, дыр стало меньше:                   {done['better']}")
     print(f"Склейка не помогла (дыры в тех же местах):   {done['same']}")
-    print(f"Пропущено (нечем заменить, разные версии…):  {done['skip']}")
+    print(f"Не читается ни там, ни там:                  {done['nowhere']}")
+    print(f"Пропущено (разные версии файла):             {done['skip']}")
+    if done["fail"]:
+        print(f"Не скопировалось (повтори --merge):          {done['fail']}")
+    if waiting or unknown:
+        print(f"Ещё не скачаны из твоей копии, не сверялись: {len(waiting) + len(unknown)} — докачай и повтори --merge")
     print(f"Подробно — {REPORT_NAME} в {to}")
 
 
@@ -310,6 +404,7 @@ def main():
     ap.add_argument("link")
     ap.add_argument("folder")
     ap.add_argument("--merge", nargs=2, metavar=("КУДА", "ОТКУДА"))
+    ap.add_argument("--partial", action="store_true", help="с --merge: склеить уже скачанное, хоть своя копия и не докачана")
     a = ap.parse_args()
     try:
         parsed = public.parse_link(a.link)
@@ -325,7 +420,7 @@ def main():
         own = rows_under(db, own_root)
         bad = sorted(rel for rel, v in pub.items() if kind(v[0], v[1]) in ("damaged", "failed"))
         if a.merge:
-            do_merge(db, key, pid, own_root, a.merge[0], a.merge[1], pub, own, bad)
+            do_merge(db, key, pid, own_root, a.merge[0], a.merge[1], pub, own, bad, a.partial)
             return 0
         report(a.link, own_root, pub, own, bad)
         if bad:
