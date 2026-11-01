@@ -37,6 +37,8 @@ API_RETRY_PAUSE = 30          # сек между попытками
 API_HANG_RESTART = 6 * 60     # сек подряд без ответа — программа зависла: перезапустить её
 API_HANG_RESTARTS = 3         # столько перезапусков подряд не помогло — сдаться
 RESTART_CMD = ["systemctl", "restart", "yandexdl-app"]
+AUTH_RESTARTS = 3             # вход в Яндекс протух (HTTP 403): столько перезапусков программы подряд без толку — сдаться
+AUTH_WAIT = 5 * 60            # сек: после перезапуска ждать, пока окно программы откроет Диск и передаст вход заново
 LIMIT_WAIT = 60 * 60          # сек: Яндекс ограничил скачивание по общей ссылке — подождать и попробовать снова
 LIMIT_WAITS = 48              # столько ожиданий подряд без единого скачанного файла — сдаться
 
@@ -107,6 +109,10 @@ def restart_program(why, silent):
         return False
     log(f"(!) программа не отвечает {int(silent // 60)} мин ({why}); {memory_text() or 'сколько памяти — не знаю'} — "
         f"перезапускаю её: {' '.join(RESTART_CMD)}")
+    return run_restart()
+
+
+def run_restart():
     try:
         r = subprocess.run(RESTART_CMD, capture_output=True, text=True, timeout=300)
     except (OSError, subprocess.SubprocessError) as e:
@@ -224,6 +230,7 @@ def download_round(mover=None):
     last_print = 0
     restarts = done_then = 0
     limit_waits, limit_done = 0, None
+    auth_restarts, auth_done = 0, None
     while True:
         time.sleep(5)
         st = api("/api/fl/status")
@@ -246,6 +253,21 @@ def download_round(mover=None):
                     if mover:
                         mover.move(api("/api/fl/status"))
                     time.sleep(LIMIT_WAIT)
+                    start_download()
+                    continue
+            if left and msg.startswith("Остановился") and "протухл" in msg:
+                # Яндекс не принял вход (HTTP 403). Часто протух только рабочий ключ (sk), а сам вход жив: перезапуск
+                # программы открывает Диск заново с сохранёнными куками, и окно передаёт свежий ключ. Без единого
+                # нового файла AUTH_RESTARTS раз подряд — значит, вход и правда кончился: нужен «yandexdl vnc».
+                auth_restarts = auth_restarts + 1 if c["done"] == auth_done else 1
+                auth_done = c["done"]
+                if auth_restarts <= AUTH_RESTARTS and shutil.which(RESTART_CMD[0]):
+                    log(f"(!) {msg[len('Остановился: '):]} — перезапускаю программу, чтобы она заново открыла Диск "
+                        f"и взяла свежий ключ ({auth_restarts}-й раз подряд из {AUTH_RESTARTS})")
+                    if run_restart():
+                        log("вход обновлён — продолжаю" if fresh_auth() else
+                            "(!) окно программы не передало вход заново за 5 мин — всё равно пробую")
+                    restarted(api("/api/fl/status"))      # этот перезапуск — наш, сбоем его не считаем
                     start_download()
                     continue
             if left and (crashed or no_space or msg.startswith("ошибка менеджера")):
@@ -284,6 +306,17 @@ def download_round(mover=None):
             log(f"скачано {c['done']} ({human(c['done_bytes'])}), ошибок {c['failed']}, "
                 f"осталось {c['remaining'] + c['queued'] + c['downloading']} ({human(c['remaining_bytes'])}), "
                 f"скорость {human(st['speed'])}/с{eta}")
+
+
+def fresh_auth():
+    """После перезапуска программы: дождаться, пока её окно откроет Диск и передаст куки и ключ заново."""
+    t0 = time.time()
+    while time.time() - t0 < AUTH_WAIT:
+        time.sleep(10)
+        a = api("/api/auth/status")
+        if a.get("has_sk") and a.get("age_sec") is not None and a["age_sec"] < time.time() - t0:
+            return True
+    return False
 
 
 def eta_text(sec):
@@ -689,8 +722,10 @@ def run(folder, dest, dump_dir, no_crawl=False, recrawl=False, mover=None, threa
         raise Fail("Яндекс больше не даёт качать по этой ссылке (превышен лимит скачиваний). Обычно лимит снимается "
                    "через сутки — тогда повтори ту же команду: скачанное не перекачается, список заново не собирается")
     if msg.startswith("Остановился"):
-        raise Fail("скачивание прервалось из-за входа в Яндекс: войди заново через «yandexdl vnc», "
-                   "открой Диск и повтори ту же команду — уже скачанное не перекачается, обход заново не начнётся")
+        raise Fail("скачивание прервалось из-за входа в Яндекс"
+                   + (" (перезапуск программы не помог)" if "протухл" in msg else "")
+                   + ": войди заново через «yandexdl vnc», открой Диск и повтори ту же команду — уже скачанное "
+                   "не перекачается, обход заново не начнётся")
     if left_files(c):
         if msg.startswith("Нет места"):
             hint = "освободи место на сервере (или качай частями: --rclone имя:папка) и повтори ту же команду"

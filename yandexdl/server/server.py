@@ -805,8 +805,8 @@ def get_download_url(path: str) -> str:
             text = resp.read().decode("utf-8", "replace")
     except urllib.error.HTTPError as e:
         if e.code in (401, 403):
-            raise AuthError(f"Яндекс ответил HTTP {e.code}: сессия или sk протухли — обнови страницу Диска "
-                            "в браузере через mitmproxy")
+            raise AuthError(f"Яндекс ответил HTTP {e.code}: сессия или sk протухли — обнови Диск во вкладке программы "
+                            "(или перезапусти её), не поможет — войди в Яндекс заново")
         raise VideoError(f"запрос ссылки: HTTP {e.code}")
     except (urllib.error.URLError, socket.timeout, TimeoutError, OSError) as e:
         raise VideoError(f"запрос ссылки: {short_err(e)}")
