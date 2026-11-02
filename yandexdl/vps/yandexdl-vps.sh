@@ -340,6 +340,16 @@ cmd_status() {
     echo "Задание не идёт. Чем закончился последний запуск fetch:"
   fi
   journalctl -u yandexdl-fetch -n 8 -o cat --no-pager -q || true
+  # сверка со своей копией (yandexdl compare … --merge) — если она когда-нибудь запускалась
+  if systemctl is-active -q yandexdl-merge; then
+    echo
+    echo "Сверка идёт (yandexdl-merge), последние строки (следить: journalctl -u yandexdl-merge -f -o cat):"
+    journalctl -u yandexdl-merge -n 4 -o cat --no-pager -q || true
+  elif [ -n "$(journalctl -u yandexdl-merge -n 1 -o cat --no-pager -q 2>/dev/null)" ]; then
+    echo
+    echo "Сверка не идёт. Чем закончилась последняя:"
+    journalctl -u yandexdl-merge -n 14 -o cat --no-pager -q | grep -v '^$' || true
+  fi
 }
 
 cmd_pick() {
