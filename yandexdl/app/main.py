@@ -259,7 +259,9 @@ class FolderCrawler(QObject):
             return
 
         if self.current is None:
-            nxt = self._api("/api/fl/next-folder", {}) or {}
+            nxt = self._api("/api/fl/next-folder", {})
+            if nxt is None:      # программа не ответила за 3 с (занята) — это не конец обхода, спросим на следующем такте
+                return
             if not nxt.get("path"):
                 self._finish("готово: все найденные папки пройдены")
                 return
@@ -275,7 +277,9 @@ class FolderCrawler(QObject):
                          "«Обход» и запусти обход снова")
             return
         self.view.page().runJavaScript(SCROLL_JS)
-        info = self._api(f"/api/fl/folder?path={quote(self.current)}&since={quote(self.since or '')}") or {}
+        info = self._api(f"/api/fl/folder?path={quote(self.current)}&since={quote(self.since or '')}")
+        if info is None:         # не ответила — не считаем это «содержимое не меняется», проверим на следующем такте
+            return
         fresh = info.get("fresh", -1)
         if fresh == self.last_fresh:
             self.stable += 1

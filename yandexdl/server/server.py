@@ -323,6 +323,7 @@ def init_db():
             );
             CREATE INDEX IF NOT EXISTS idx_files_parent ON files(parent);
             CREATE INDEX IF NOT EXISTS idx_files_fl     ON files(fl_status);
+            CREATE INDEX IF NOT EXISTS idx_files_crawl  ON files(kind, crawled_at);   -- следующая непройденная папка
             """
         )
         # после перезапуска «зависшие» элементы очереди возвращаем в исходное состояние
