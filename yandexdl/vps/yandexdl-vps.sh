@@ -16,6 +16,8 @@
 #   bash yandexdl-vps.sh errors [Папка]     что не скачалось и что повреждено (можно во время загрузки)
 #   bash yandexdl-vps.sh compare Ссылка Папка [--merge Куда Откуда [--partial]]   сверить общую папку со своей копией:
 #                                           что докачать из своей, потом склеить лучшее (см. README)
+#   bash yandexdl-vps.sh repair Папка|Ссылка --rclone gdrive:Папка [--exclude Папка]…   повреждённые файлы —
+#                                           скачать заново и склеить с сохранёнными (хуже не станет)
 #   bash yandexdl-vps.sh diagnose           в каком виде Диск отдаёт списки папок (если файлов 0)
 #   bash yandexdl-vps.sh start|stop|restart|logs
 set -euo pipefail
@@ -84,6 +86,8 @@ cmd_install() {
   # перезапуск программы оборвал бы задание старой версии; новая продолжит его с того же места
   systemctl is-active -q yandexdl-fetch 2>/dev/null \
     && die "идёт задание (yandexdl status). Останови его: systemctl stop yandexdl-fetch — после установки повтори ту же команду fetch, она продолжит"
+  systemctl is-active -q yandexdl-repair 2>/dev/null \
+    && die "идёт повтор повреждённых (yandexdl status) — он качает через программу. Дождись его или останови: systemctl stop yandexdl-repair (повтор той же команды начнёт с непроверенных)"
 
   say "Система"
   . /etc/os-release && echo "ОС: $PRETTY_NAME"
@@ -292,6 +296,9 @@ cmd_fetch() {
   if systemctl is-active -q yandexdl-fetch; then
     die "задание уже идёт (yandexdl status). Остановить его: systemctl stop yandexdl-fetch"
   fi
+  if systemctl is-active -q yandexdl-repair; then
+    die "идёт повтор повреждённых (yandexdl status) — дождись его или останови: systemctl stop yandexdl-repair"
+  fi
   if src=$(stale_src); then
     die "код в $src не совпадает с установленным в $APP_DIR, а работает установленный — после git pull или scp его нужно поставить: yandexdl update (или bash $src/vps/yandexdl-vps.sh install), потом повтори fetch"
   fi
@@ -340,16 +347,20 @@ cmd_status() {
     echo "Задание не идёт. Чем закончился последний запуск fetch:"
   fi
   journalctl -u yandexdl-fetch -n 8 -o cat --no-pager -q || true
-  # сверка со своей копией (yandexdl compare … --merge) — если она когда-нибудь запускалась
-  if systemctl is-active -q yandexdl-merge; then
-    echo
-    echo "Сверка идёт (yandexdl-merge), последние строки (следить: journalctl -u yandexdl-merge -f -o cat):"
-    journalctl -u yandexdl-merge -n 4 -o cat --no-pager -q || true
-  elif [ -n "$(journalctl -u yandexdl-merge -n 1 -o cat --no-pager -q 2>/dev/null)" ]; then
-    echo
-    echo "Сверка не идёт. Чем закончилась последняя:"
-    journalctl -u yandexdl-merge -n 14 -o cat --no-pager -q | grep -v '^$' || true
-  fi
+  # сверка со своей копией (compare … --merge) и повтор повреждённых (repair) — если запускались
+  local u what
+  for u in yandexdl-merge yandexdl-repair; do
+    [ "$u" = yandexdl-merge ] && what="Сверка" || what="Повтор повреждённых"
+    if systemctl is-active -q "$u"; then
+      echo
+      echo "$what идёт ($u), последние строки (следить: journalctl -u $u -f -o cat):"
+      journalctl -u "$u" -n 4 -o cat --no-pager -q || true
+    elif [ -n "$(journalctl -u "$u" -n 1 -o cat --no-pager -q 2>/dev/null)" ]; then
+      echo
+      echo "$what не идёт. Чем закончился последний раз:"
+      journalctl -u "$u" -n 14 -o cat --no-pager -q | grep -v '^$' || true
+    fi
+  done
 }
 
 cmd_pick() {
@@ -371,6 +382,7 @@ cmd_compare() {
   # склейка долгая (файлы гоняются через облако) — в фоне, как fetch
   systemctl is-active -q yandexdl-fetch && die "сначала дождись конца загрузки (или останови её: systemctl stop yandexdl-fetch)"
   systemctl is-active -q yandexdl-merge && die "сверка уже идёт — смотреть: journalctl -u yandexdl-merge -f -o cat"
+  systemctl is-active -q yandexdl-repair && die "идёт повтор повреждённых — дождись его (yandexdl status)"
   systemctl reset-failed yandexdl-merge.service 2>/dev/null || true
   systemd-run -q --unit=yandexdl-merge --collect --setenv=HOME=/root "$VENV/bin/python" -u "$APP_DIR/vps/compare.py" "$@"
   echo "Сверка идёт в фоне (служба yandexdl-merge) — можно закрыть SSH. Снова смотреть: journalctl -u yandexdl-merge -f -o cat"
@@ -379,6 +391,26 @@ cmd_compare() {
   local jpid=$!
   trap 'kill $jpid 2>/dev/null; exit 0' INT
   while systemctl is-active -q yandexdl-merge; do sleep 2; done
+  sleep 1; kill $jpid 2>/dev/null || true
+}
+
+cmd_repair() {
+  need_root
+  [ $# -ge 1 ] || die "нужна папка или ссылка и облако: yandexdl repair / --rclone gdrive:Yandex"
+  [ -f "$APP_DIR/vps/repair.py" ] || die "установлена старая версия без повтора повреждённых — сначала yandexdl update"
+  local u
+  for u in yandexdl-fetch yandexdl-merge yandexdl-repair; do
+    systemctl is-active -q "$u" && die "сначала дождись, пока закончится $u (yandexdl status), или останови: systemctl stop $u"
+  done
+  wait_api 3 15 || die "программа не отвечает — посмотри yandexdl status"
+  systemctl reset-failed yandexdl-repair.service 2>/dev/null || true
+  systemd-run -q --unit=yandexdl-repair --collect --setenv=HOME=/root "$VENV/bin/python" -u "$APP_DIR/vps/repair.py" "$@"
+  echo "Повтор повреждённых идёт в фоне (служба yandexdl-repair) — можно закрыть SSH. Ход: yandexdl status"
+  echo
+  journalctl -u yandexdl-repair -f -o cat --since "-5s" &
+  local jpid=$!
+  trap 'kill $jpid 2>/dev/null; exit 0' INT
+  while systemctl is-active -q yandexdl-repair; do sleep 2; done
   sleep 1; kill $jpid 2>/dev/null || true
 }
 
@@ -404,5 +436,6 @@ case "${1:-}" in
   logs)     shift; cmd_logs "$@" ;;
   errors)   shift; cmd_errors "$@" ;;
   compare)  shift; cmd_compare "$@" ;;
-  *) sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 1 ;;
+  repair)   shift; cmd_repair "$@" ;;
+  *) sed -n '2,22p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac

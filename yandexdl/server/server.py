@@ -3242,6 +3242,31 @@ class FileDownloader:
 FL = FileDownloader()
 
 
+def fetch_copy(path, dest, size):
+    """Скачать файл заново в dest так же, как загрузчик (целиком; оборвалось — спасение по кускам), но мимо его очереди
+    и статусов: для повтора повреждённых (vps/repair.py склеивает новую копию с уже сохранённой). Возвращает заметку
+    о потерях или None — скачан целиком. Unreadable — не отдал ни байта; AuthError (и LinkLimit) — вход или лимит."""
+    fd = FileDownloader()
+    fd.stop_event.clear()
+    prog = {"name": name_from_path(path), "path": path, "bytes": 0, "total": size}
+    if os.path.exists(dest):
+        os.remove(dest)
+    errors = []
+    for attempt in range(1, FL_ATTEMPTS + 1):
+        try:
+            if attempt == 1 or not size:
+                fd._fetch(path, dest, size, prog)
+                return None
+            return fd._salvage(path, dest, size, prog)[1]
+        except (AuthError, Unreadable):
+            raise
+        except Exception as e:  # noqa: BLE001
+            errors.append(f"{attempt}: {e if isinstance(e, VideoError) or type(e) is OSError else short_err(e)}")
+            if attempt < FL_ATTEMPTS and not size:
+                time.sleep(min(30, 3 * attempt))
+    raise VideoError("; ".join(errors))
+
+
 class CrawlState:
     """
     Автоматический обход папок. Сам сервер в браузер не ходит: обход выполняет окно приложения
@@ -3505,6 +3530,33 @@ def api_fl_public():
     n = ingest_public(pid, key, body.get("name"), body.get("files") or [],
                       listed if isinstance(listed, str) else None, bool(body.get("file")))
     return jsonify(ok=True, files=n, root=public_roots().get(pid))
+
+
+@app.post("/api/fl/fetch-copy")
+def api_fl_fetch_copy():
+    """Скачать один файл заново в dest (внутри папки загрузок) — для повтора повреждённых. Ждёт, пока скачается."""
+    body = request.get_json(silent=True) or {}
+    path, dest = body.get("path"), body.get("dest")
+    root = os.path.abspath(files_dir())
+    if not (isinstance(path, str) and isinstance(dest, str)) or \
+            os.path.commonpath([root, os.path.abspath(dest)]) != root:
+        return jsonify(ok=False, error="нужны path и dest внутри папки загрузок"), 400
+    with dbc() as c:
+        row = c.execute("SELECT size FROM files WHERE path=? AND kind='file'", (path,)).fetchone()
+    if not row:
+        return jsonify(ok=False, error="такого файла программа не знает"), 404
+    os.makedirs(os.path.dirname(os.path.abspath(dest)), exist_ok=True)
+    try:
+        note = fetch_copy(path, dest, row[0])
+    except LinkLimit as e:
+        return jsonify(ok=False, limit=True, error=str(e))
+    except AuthError as e:
+        return jsonify(ok=False, auth=True, error=str(e))
+    except Unreadable as e:
+        return jsonify(ok=False, unreadable=True, error=str(e))
+    except Exception as e:  # noqa: BLE001
+        return jsonify(ok=False, error=str(e) if isinstance(e, VideoError) else short_err(e))
+    return jsonify(ok=True, note=note, size=os.path.getsize(dest))
 
 
 @app.get("/api/fl/damaged")
