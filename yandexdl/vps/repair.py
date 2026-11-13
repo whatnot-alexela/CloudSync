@@ -29,7 +29,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import compare  # noqa: E402
 import fetch  # noqa: E402
 import public  # noqa: E402
-from compare import BLOCK, Fail, human, log, lost_of, merge, rclone, remote_join, zero_blocks  # noqa: E402
+from compare import BLOCK, Fail, human, log, lost_of, merge, rclone, rclone_try, remote_join, zero_blocks  # noqa: E402
 
 WORK = os.path.join(compare.WORK, "повтор")
 FETCH_TIMEOUT = 6 * 3600      # сек: спасение большого битого файла по кускам бывает долгим
@@ -77,6 +77,10 @@ def repair_one(n, row, remote, key):
     cloud = remote_join(remote, fl_file.split("/", 2)[2] if key else fl_file.split("/", 1)[1])
     new, old, m = (os.path.join(WORK, f"{n}.{x}") for x in ("новая", "старая", "склейка"))
     try:
+        # Сначала — есть ли старая версия там, где её ищем: нет — значит, папку качали в другое облако (--rclone не тот),
+        # и класть туда ничего нельзя: рядом выросла бы вторая копия папки.
+        if rclone_try("lsjson", "--stat", cloud)[0]:
+            return "nocloud", f"в облаке нет {cloud}"
         free = shutil.disk_usage(WORK).free
         if free < 3 * (size or 0) + 2 * 1024 ** 3:
             return "error", f"мало места на сервере для {human(size)} (свободно {human(free)})"
@@ -142,7 +146,8 @@ def main():
         if not rows:
             return 0
         os.makedirs(WORK, exist_ok=True)
-        done = {"whole": 0, "better": 0, "same": 0, "unreadable": 0, "error": 0}
+        done = {"whole": 0, "better": 0, "same": 0, "unreadable": 0, "error": 0, "nocloud": 0}
+        nocloud = []
         pending, running, auth_tries, stop, t, n = deque(rows), {}, 0, None, time.time(), 0
         with ThreadPoolExecutor(a.jobs) as ex:
             while (pending and not stop) or running:
@@ -167,6 +172,10 @@ def main():
                     auth_tries = 0
                     if kind == "error":
                         log(f"(!) {row[0]}: {note}")
+                    if kind == "nocloud":
+                        nocloud.append(note)
+                        if len(nocloud) <= 3:
+                            log(f"(!) {note} — этот файл пропускаю; папку, видно, качали в другое облако")
                     ts = time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime())
                     if kind in ("whole", "better"):
                         db.execute("UPDATE files SET fl_note=?, fl_at=? WHERE path=?", (note, ts, row[0]))
@@ -192,6 +201,9 @@ def main():
         print(f"Сейчас не читается вовсе:  {done['unreadable']} (сохранённая версия осталась как была)")
         if done["error"]:
             print(f"Не вышло (см. выше):       {done['error']}")
+        if nocloud:
+            print(f"Нет в облаке по этому пути: {len(nocloud)} — их папку fetch качал в другое облако: повтори для неё "
+                  f"с тем --rclone, что был у fetch (например: {nocloud[0]})")
         if pending:
             print(f"Не проверены:              {len(pending)}")
         if stop:
