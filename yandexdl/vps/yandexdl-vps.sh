@@ -18,6 +18,8 @@
 #                                           что докачать из своей, потом склеить лучшее (см. README)
 #   bash yandexdl-vps.sh repair Папка|Ссылка --rclone gdrive:Папка [--exclude Папка]…   повреждённые файлы —
 #                                           скачать заново и склеить с сохранёнными (хуже не станет)
+#   bash yandexdl-vps.sh verify Папка|Ссылка --rclone gdrive:Папка [--exclude Папка]… [--fix]   всё ли скачанное
+#                                           лежит в облаке; --fix — пропавшее поставить на скачивание заново
 #   bash yandexdl-vps.sh diagnose           в каком виде Диск отдаёт списки папок (если файлов 0)
 #   bash yandexdl-vps.sh start|stop|restart|logs
 set -euo pipefail
@@ -419,6 +421,18 @@ cmd_repair() {
   sleep 1; kill $jpid 2>/dev/null || true
 }
 
+cmd_verify() {
+  [ $# -ge 1 ] || die "нужна папка или ссылка и облако: yandexdl verify / --rclone gdrive:Yandex"
+  [ -f "$APP_DIR/vps/verify.py" ] || die "установлена старая версия без проверки облака — сначала yandexdl update"
+  if [[ " $* " == *" --fix "* ]]; then
+    local u
+    for u in yandexdl-fetch yandexdl-repair; do
+      systemctl is-active -q "$u" && die "с --fix — когда не идёт $u (yandexdl status); без --fix можно и сейчас"
+    done
+  fi
+  "$VENV/bin/python" -u "$APP_DIR/vps/verify.py" "$@"
+}
+
 cmd_errors() {
   wait_api 3 15 || die "программа не отвечает — посмотри yandexdl status"
   "$VENV/bin/python" -u "$APP_DIR/vps/fetch.py" --errors "$@"
@@ -442,5 +456,6 @@ case "${1:-}" in
   errors)   shift; cmd_errors "$@" ;;
   compare)  shift; cmd_compare "$@" ;;
   repair)   shift; cmd_repair "$@" ;;
-  *) sed -n '2,22p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 1 ;;
+  verify)   shift; cmd_verify "$@" ;;
+  *) sed -n '2,24p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac
