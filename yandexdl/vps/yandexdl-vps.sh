@@ -323,6 +323,11 @@ mem_text() {     # «доступно памяти 95 из 1987 МБ, подка
        END{printf "доступно памяти %d из %d МБ", a/1024, t/1024; if (st) printf ", подкачка занята %d из %d МБ", (st-sf)/1024, st/1024}' /proc/meminfo
 }
 
+last_time() {    # когда служба последний раз писала в журнал: «07.11 15:36»
+  journalctl -u "$1" -n 1 -o short-iso --no-pager -q 2>/dev/null | head -1 \
+    | sed -nE 's/^[0-9]{4}-([0-9]{2})-([0-9]{2})T([0-9]{2}:[0-9]{2}).*/\2.\1 \3/p'
+}
+
 cmd_status() {
   if wait_api 3 15; then
     "$VENV/bin/python" -u "$APP_DIR/vps/fetch.py" --status
@@ -344,7 +349,7 @@ cmd_status() {
   if systemctl is-active -q yandexdl-fetch; then
     echo "Задание идёт (yandexdl-fetch), последние строки:"
   else
-    echo "Задание не идёт. Чем закончился последний запуск fetch:"
+    echo "Задание не идёт. Чем закончился последний запуск fetch ($(last_time yandexdl-fetch)):"
   fi
   journalctl -u yandexdl-fetch -n 8 -o cat --no-pager -q || true
   # сверка со своей копией (compare … --merge) и повтор повреждённых (repair) — если запускались
@@ -357,7 +362,7 @@ cmd_status() {
       journalctl -u "$u" -n 4 -o cat --no-pager -q || true
     elif [ -n "$(journalctl -u "$u" -n 1 -o cat --no-pager -q 2>/dev/null)" ]; then
       echo
-      echo "$what не идёт. Чем закончился последний раз:"
+      echo "$what не идёт. Чем закончился последний раз ($(last_time "$u")):"
       journalctl -u "$u" -n 14 -o cat --no-pager -q | grep -v '^$' || true
     fi
   done
