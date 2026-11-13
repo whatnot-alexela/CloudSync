@@ -19,6 +19,7 @@ import os
 import shutil
 import sqlite3
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -34,6 +35,7 @@ from compare import BLOCK, Fail, human, log, lost_of, merge, rclone, rclone_try,
 WORK = os.path.join(compare.WORK, "повтор")
 FETCH_TIMEOUT = 6 * 3600      # сек: спасение большого битого файла по кускам бывает долгим
 _OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+UPLOAD_LOCK = threading.Lock()
 
 
 def fetch_copy(path, dest):
@@ -71,16 +73,28 @@ def disk_md5(raw):
     return m if isinstance(m, str) and len(m) == 32 else None
 
 
+def upload(src, dst):
+    """В облако — по одному: два rclone, разом создающие одну и ту же недостающую папку, в Google Drive создают
+    две папки с одним именем."""
+    with UPLOAD_LOCK:
+        rclone("copyto", src, dst)
+
+
 def repair_one(n, row, remote, key):
     """Один файл: скачать заново, склеить со старой версией из облака, положить лучшее. -> (итог, заметка)."""
     path, size, note, fl_file, raw, rel = row
-    cloud = remote_join(remote, fl_file.split("/", 2)[2] if key else fl_file.split("/", 1)[1])
+    tail = fl_file.split("/", 2)[2] if key else fl_file.split("/", 1)[1]
+    cloud = remote_join(remote, tail)
     new, old, m = (os.path.join(WORK, f"{n}.{x}") for x in ("новая", "старая", "склейка"))
     try:
-        # Сначала — есть ли старая версия там, где её ищем: нет — значит, папку качали в другое облако (--rclone не тот),
-        # и класть туда ничего нельзя: рядом выросла бы вторая копия папки.
-        if rclone_try("lsjson", "--stat", cloud)[0]:
-            return "nocloud", f"в облаке нет {cloud}"
+        # Есть ли старая версия там, где её ищем. Нет, и нет даже папки верхнего уровня (или корня ссылки) — папку,
+        # видно, качали в другое облако: класть туда нельзя, рядом выросла бы вторая копия. Папка есть, а файла нет —
+        # он до облака не доехал или пропал: тогда кладём то, что скачаем сейчас.
+        missing = bool(rclone_try("lsjson", "--stat", cloud)[0])
+        if missing:
+            anchor = remote if key or "/" not in tail else remote_join(remote, tail.split("/", 1)[0])
+            if rclone_try("lsjson", "--stat", anchor)[0]:
+                return "nocloud", f"в облаке нет {anchor}"
         free = shutil.disk_usage(WORK).free
         if free < 3 * (size or 0) + 2 * 1024 ** 3:
             return "error", f"мало места на сервере для {human(size)} (свободно {human(free)})"
@@ -91,18 +105,22 @@ def repair_one(n, row, remote, key):
             return kind, r.get("error") or "без объяснения"
         want = compare.original_md5(key, rel) if key else disk_md5(raw)
         if r.get("note") is None and (not want or file_md5(new) == want):      # Яндекс отдал файл целиком
-            rclone("copyto", new, cloud)
-            return "whole", "восстановлен при повторе: скачан целиком" + (" (md5 совпал с оригиналом)" if want else "")
+            upload(new, cloud)
+            return "whole", ("восстановлен при повторе: скачан целиком" + (" (md5 совпал с оригиналом)" if want else "")
+                             + (" — в облаке его не было" if missing else ""))
+        if missing:                                                              # склеивать не с чем — кладём, что есть
+            upload(new, cloud)
+            return "put", f"{r['note']} — в облаке его не было, положен скачанный при повторе"
         rclone("copyto", cloud, old)
         got, conflicts = merge(new, old, m)
         if conflicts:
             return "error", f"новая и старая копии различаются в {conflicts} местах — это разные версии, не склеиваю"
         before, after = zero_blocks(old), zero_blocks(m)
         if want and got == want:
-            rclone("copyto", m, cloud)
+            upload(m, cloud)
             return "whole", "восстановлен при повторе: склеен из старой и новой копий, md5 совпал с оригиналом"
         if after < before:
-            rclone("copyto", m, cloud)
+            upload(m, cloud)
             if after == 0 and not want:
                 return "whole", "восстановлен при повторе: дыр не осталось (сверить не с чем — md5 Диск не сообщил)"
             return "better", (f"повреждён: потеряно {after * BLOCK} из {size} байт (примерно) — дыр стало меньше "
@@ -146,7 +164,7 @@ def main():
         if not rows:
             return 0
         os.makedirs(WORK, exist_ok=True)
-        done = {"whole": 0, "better": 0, "same": 0, "unreadable": 0, "error": 0, "nocloud": 0}
+        done = {"whole": 0, "better": 0, "same": 0, "unreadable": 0, "error": 0, "nocloud": 0, "put": 0}
         nocloud = []
         pending, running, auth_tries, stop, t, n = deque(rows), {}, 0, None, time.time(), 0
         with ThreadPoolExecutor(a.jobs) as ex:
@@ -177,7 +195,7 @@ def main():
                         if len(nocloud) <= 3:
                             log(f"(!) {note} — этот файл пропускаю; папку, видно, качали в другое облако")
                     ts = time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime())
-                    if kind in ("whole", "better"):
+                    if kind in ("whole", "better", "put"):
                         db.execute("UPDATE files SET fl_note=?, fl_at=? WHERE path=?", (note, ts, row[0]))
                     else:                                      # попробовали — в следующий раз этот файл в конце очереди
                         db.execute("UPDATE files SET fl_at=? WHERE path=?", (ts, row[0]))
@@ -199,6 +217,8 @@ def main():
         print(f"Дыр стало меньше:          {done['better']}")
         print(f"Без изменений:             {done['same']}")
         print(f"Сейчас не читается вовсе:  {done['unreadable']} (сохранённая версия осталась как была)")
+        if done["put"]:
+            print(f"Не было в облаке, положены с дырами: {done['put']} (раньше до облака не доехали)")
         if done["error"]:
             print(f"Не вышло (см. выше):       {done['error']}")
         if nocloud:
