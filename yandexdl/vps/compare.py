@@ -16,6 +16,7 @@
 """
 import argparse
 import hashlib
+import json
 import os
 import shutil
 import sqlite3
@@ -100,6 +101,24 @@ def rclone(*args):
     if r.returncode:
         raise Fail(f"rclone {args[0]}: {(r.stderr or r.stdout).strip()[-300:]}")
     return r.stdout
+
+
+class CloudIndex:
+    """Что лежит в облаке под top — одним списком rclone: пути (от top) с размерами. По нему же узнаётся файл, который
+    в облаке переложили в другую папку: единственный файл с тем же именем и размером не на своём месте."""
+
+    def __init__(self, top):
+        self.top, self.size, self._by_key = top, {}, {}
+        out = rclone("lsjson", "-R", "--files-only", "--fast-list", "--no-mimetype", "--no-modtime", top)
+        for it in json.loads(out or "[]"):
+            p, s = it["Path"], it.get("Size")
+            self.size[p] = s
+            self._by_key.setdefault((p.rsplit("/", 1)[-1], s), []).append(p)
+
+    def moved(self, rel, size, taken=frozenset()):
+        """Куда в облаке переложили файл rel (путь от top): все места, где лежит файл с тем же именем и размером
+        (кроме чужих — taken); пусто — не нашёлся. Мест бывает несколько: файл скопировали в разные папки."""
+        return sorted(p for p in self._by_key.get((rel.rsplit("/", 1)[-1], size), ()) if p != rel and p not in taken)
 
 
 def cloud_md5(path):

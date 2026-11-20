@@ -10,7 +10,6 @@
 нет целиком, --fix не трогает: скорее всего, её переносили в другое облако — проверь её с тем --rclone.
 """
 import argparse
-import json
 import os
 import sqlite3
 import sys
@@ -55,29 +54,35 @@ def main():
         base = "/".join(rows[0][1].split("/")[:depth])
         top = remote_join(a.rclone, base) if base else a.rclone
         log(f"читаю, что лежит в {top} …")
-        listing, absent = {}, False
+        listing, absent, idx = {}, False, None
         try:
-            out = rclone("lsjson", "-R", "--files-only", "--fast-list", "--no-mimetype", "--no-modtime", top)
+            idx = compare.CloudIndex(top)
+            listing = idx.size
         except Fail as e:
             if "not found" not in str(e):
                 raise
             # папки нет совсем: либо её переносили в другое облако (тогда --rclone не тот), либо её там удалили —
             # тогда, раз её назвали явно, --fix скачает её заново целиком
-            absent, out = True, "[]"
+            absent = True
             print(f"(!) Папки {top} в облаке нет совсем. Если её переносили в другое облако — проверь с тем --rclone; "
                   "если её там удалили — та же команда с --fix поставит её на скачивание заново целиком.")
-        for it in json.loads(out or "[]"):
-            listing[it["Path"]] = it.get("Size")
         dirs = {p.split("/", 1)[0] for p in listing if "/" in p}
-        missing, other_size = [], []
-        for path, tail, size in rows:
-            rel = tail[len(base) + 1:] if base else tail
+        missing, other_size, moved = [], [], []
+        rels = [(path, tail[len(base) + 1:] if base else tail, size) for path, tail, size in rows]
+        taken = {rel for _, rel, _ in rels if rel in listing}         # файлы на своих местах — не чужие «переложенные»
+        for path, rel, size in rels:
             if rel not in listing:
-                missing.append((path, rel))
+                to = idx.moved(rel, size, taken) if idx else []       # в облаке переложили в другую папку?
+                (moved.append((rel, to)) if to else missing.append((path, rel)))
             elif size is not None and listing[rel] not in (None, -1, size):
                 other_size.append((rel, size, listing[rel]))
-        print(f"\nСкачано по базе: {len(rows)} файлов; в облаке на месте: {len(rows) - len(missing) - len(other_size)}, "
+        print(f"\nСкачано по базе: {len(rows)} файлов; в облаке на месте: "
+              f"{len(rows) - len(missing) - len(other_size) - len(moved)}, переложены в другую папку: {len(moved)}, "
               f"нет в облаке: {len(missing)}, другого размера: {len(other_size)}")
+        if moved:
+            print(f"\nПЕРЕЛОЖЕНЫ в облаке (нашлись по имени и размеру в другой папке; --fix их не трогает), например:")
+            for rel, to in moved[:EXAMPLES]:
+                print(f"    {rel}\n      → {to[0]}" + (f"  (и ещё в {len(to) - 1} местах)" if len(to) > 1 else ""))
         groups = Counter(rel.split("/", 1)[0] if "/" in rel else "(прямо в папке)" for _, rel in missing)
         gone = set() if absent else {g for g in groups if g != "(прямо в папке)" and g not in dirs}   # нет целиком
         if missing:

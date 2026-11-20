@@ -75,12 +75,39 @@ def disk_md5(raw):
 
 def upload(src, dst):
     """В облако — по одному: два rclone, разом создающие одну и ту же недостающую папку, в Google Drive создают
-    две папки с одним именем."""
+    две папки с одним именем. dst — путь или несколько (одинаковые копии файла в разных папках)."""
     with UPLOAD_LOCK:
-        rclone("copyto", src, dst)
+        for d in [dst] if isinstance(dst, str) else dst:
+            rclone("copyto", src, d)
 
 
-def repair_one(n, row, remote, key):
+class MovedFinder:
+    """Ищет в облаке файл, который там переложили в другую папку (по имени и размеру). Облако читается одним списком —
+    один раз и только когда понадобится."""
+
+    def __init__(self, top, base, tails):
+        self.top, self.base, self.tails, self.idx, self.taken, self.hits = top, base, tails, None, set(), 0
+        self.lock = threading.Lock()
+
+    def rel(self, tail):
+        return tail[len(self.base) + 1:] if self.base else tail
+
+    def find(self, tail, size):
+        with self.lock:
+            if self.idx is None:
+                try:
+                    self.idx = compare.CloudIndex(self.top)
+                    self.taken = {r for r in map(self.rel, self.tails) if r in self.idx.size}
+                except Fail:
+                    self.idx = False
+        found = self.idx.moved(self.rel(tail), size, self.taken) if self.idx else []
+        if found:
+            with self.lock:
+                self.hits += 1
+        return [remote_join(self.top, m) for m in found]
+
+
+def repair_one(n, row, remote, key, finder=None):
     """Один файл: скачать заново, склеить со старой версией из облака, положить лучшее. -> (итог, заметка)."""
     path, size, note, fl_file, raw, rel = row
     tail = fl_file.split("/", 2)[2] if key else fl_file.split("/", 1)[1]
@@ -90,7 +117,14 @@ def repair_one(n, row, remote, key):
         # Есть ли старая версия там, где её ищем. Нет, и нет даже папки верхнего уровня (или корня ссылки) — папку,
         # видно, качали в другое облако: класть туда нельзя, рядом выросла бы вторая копия. Папка есть, а файла нет —
         # он до облака не доехал или пропал: тогда кладём то, что скачаем сейчас.
-        missing = bool(rclone_try("lsjson", "--stat", cloud)[0])
+        missing, targets = bool(rclone_try("lsjson", "--stat", cloud)[0]), None
+        if missing and finder:                                   # переложили в облаке в другую папку — чиним там
+            found = finder.find(tail, size)
+            if len(found) > 1 and len({compare.cloud_md5(x) for x in found}) > 1:
+                return "error", f"в облаке есть несколько разных файлов с таким именем и размером — не угадать: {found[0]}"
+            if found:                                            # несколько одинаковых копий — чиним все
+                cloud, targets, missing = found[0], found, False
+        targets = targets or cloud
         if missing:
             anchor = remote if key or "/" not in tail else remote_join(remote, tail.split("/", 1)[0])
             if rclone_try("lsjson", "--stat", anchor)[0]:
@@ -105,11 +139,11 @@ def repair_one(n, row, remote, key):
             return kind, r.get("error") or "без объяснения"
         want = compare.original_md5(key, rel) if key else disk_md5(raw)
         if r.get("note") is None and (not want or file_md5(new) == want):      # Яндекс отдал файл целиком
-            upload(new, cloud)
+            upload(new, targets)
             return "whole", ("восстановлен при повторе: скачан целиком" + (" (md5 совпал с оригиналом)" if want else "")
                              + (" — в облаке его не было" if missing else ""))
         if missing:                                                              # склеивать не с чем — кладём, что есть
-            upload(new, cloud)
+            upload(new, targets)
             return "put", f"{r['note']} — в облаке его не было, положен скачанный при повторе"
         rclone("copyto", cloud, old)
         got, conflicts = merge(new, old, m)
@@ -117,10 +151,10 @@ def repair_one(n, row, remote, key):
             return "error", f"новая и старая копии различаются в {conflicts} местах — это разные версии, не склеиваю"
         before, after = zero_blocks(old), zero_blocks(m)
         if want and got == want:
-            upload(m, cloud)
+            upload(m, targets)
             return "whole", "восстановлен при повторе: склеен из старой и новой копий, md5 совпал с оригиналом"
         if after < before:
-            upload(m, cloud)
+            upload(m, targets)
             if after == 0 and not want:
                 return "whole", "восстановлен при повторе: дыр не осталось (сверить не с чем — md5 Диск не сообщил)"
             return "better", (f"повреждён: потеряно {after * BLOCK} из {size} байт (примерно) — дыр стало меньше "
@@ -158,6 +192,15 @@ def main():
         rows = [(p, s, nt, f, rw, p[len(root):] if key else p)
                 for p, s, nt, f, rw in db.execute(q, (scope, scope + "/", scope + "/"))
                 if not any(p == x or p.startswith(x + "/") for x in excl)]
+        # облако папки — для поиска переложенных там файлов (корень — как у verify; свои места — у всех скачанных)
+        cut = 2 if key else 1
+        tails = [f.split("/", cut)[cut] for p, f in db.execute(
+            "SELECT path, fl_file FROM files WHERE kind='file' AND fl_status='done' AND fl_file IS NOT NULL "
+            "AND (path=? OR substr(path, 1, length(?))=?)", (scope, scope + "/", scope + "/"))
+            if not any(p == x or p.startswith(x + "/") for x in excl)]
+        depth = 0 if key or scope == "/disk" else scope.count("/") - 1
+        base = "/".join(tails[0].split("/")[:depth]) if tails else ""
+        finder = MovedFinder(remote_join(a.rclone, base) if base else a.rclone, base, tails)
         lost = sum(lost_of(r[2]) for r in rows)
         log(f"повреждённых файлов: {len(rows)}, в них не хватает {human(lost)} — качаю заново и склеиваю "
             f"с тем, что в {a.rclone}, по {a.jobs} сразу")
@@ -172,7 +215,7 @@ def main():
                 while pending and not stop and len(running) < a.jobs:
                     n += 1
                     row = pending.popleft()
-                    running[ex.submit(repair_one, n, row, a.rclone, key)] = row
+                    running[ex.submit(repair_one, n, row, a.rclone, key, finder)] = row
                 finished, _ = wait(running, timeout=60, return_when=FIRST_COMPLETED)
                 auth_hit = False
                 for f in finished:
@@ -217,6 +260,8 @@ def main():
         print(f"Дыр стало меньше:          {done['better']}")
         print(f"Без изменений:             {done['same']}")
         print(f"Сейчас не читается вовсе:  {done['unreadable']} (сохранённая версия осталась как была)")
+        if finder.hits:
+            print(f"Нашлись переложенными в облаке (чинились там): {finder.hits}")
         if done["put"]:
             print(f"Не было в облаке, положены с дырами: {done['put']} (раньше до облака не доехали)")
         if done["error"]:
