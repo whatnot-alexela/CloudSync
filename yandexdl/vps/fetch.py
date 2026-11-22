@@ -497,9 +497,10 @@ def lost_bytes(note):
         return 0
 
 
-def errors(folder=None):
+def errors(folder=None, exclude=()):
     """Что не скачалось и что скачалось с повреждениями — в папке, с которой работает программа, или в folder
-    (папка Диска или общая ссылка). Только читает: можно и во время загрузки."""
+    (папка Диска или общая ссылка), кроме подпапок exclude (путь от корня Диска или ссылки, как у fetch).
+    Только читает: можно и во время загрузки."""
     if not folder:
         st = api("/api/fl/status")
         r, title = api("/api/fl/damaged"), scope_title(st) + except_text(st)
@@ -514,6 +515,13 @@ def errors(folder=None):
             raise Fail(f"«{title or folder}»: {r['error']}")
         title = title or (r["folder"] + (" (весь Диск)" if r["folder"] == "/disk" else ""))
     root = r["folder"].rstrip("/") + "/"
+    if exclude:
+        base = r["folder"] if r["folder"].startswith("/public/") else "/disk"
+        if base.startswith("/public/"):
+            base = "/".join(base.split("/")[:3])                 # корень ссылки: /public/<id>
+        skip = [base + "/" + x.strip("/") for x in exclude]
+        r["items"] = [x for x in r["items"] if not any(x["path"] == e or x["path"].startswith(e + "/") for e in skip)]
+        title += ", кроме " + ", ".join(f"«{x.strip('/')}»" for x in exclude)
     failed = [x for x in r["items"] if x["fl_status"] == "failed"]
     damaged = [x for x in r["items"] if x["fl_status"] == "done"]
     print(f"Папка: {title}")
@@ -781,7 +789,7 @@ def main():
             status()
             return 0
         if a.errors is not None:
-            errors(a.errors)
+            errors(a.errors, a.exclude)
             return 0
         if not a.folder:
             p.error("--folder обязателен")

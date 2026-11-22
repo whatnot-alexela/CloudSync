@@ -202,7 +202,8 @@ yandexdl compare "https://disk.yandex.ru/d/КОД" "Загрузки/Папка"
 «не читается». `fetch` кладёт рядом со скачанным `_повреждённые_файлы.txt` со списком тех и других;
 `--retry-failed` — ещё раз попробовать то, что не скачалось. Тот же список прямо сейчас, не дожидаясь конца
 (и во время загрузки) — `yandexdl errors`; по другой папке — `yandexdl errors /` (весь Диск), `yandexdl errors
-"Творчество"` или `yandexdl errors "https://disk.yandex.ru/d/…"`.
+"Творчество"` или `yandexdl errors "https://disk.yandex.ru/d/…"`; без каких-то подпапок — `--exclude` (путь от корня
+Диска или ссылки, как у `fetch`), например `yandexdl errors / --exclude "Творчество"`.
 
 Яндекс со временем снова отдаёт часть файлов, поэтому повторять стоит. Нечитаемые — та же команда `fetch` с
 `--retry-failed`. Скачанные с дырами — `yandexdl repair` (в фоне, служба `yandexdl-repair`, ход — в `yandexdl status`):

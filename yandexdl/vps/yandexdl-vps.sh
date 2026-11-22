@@ -13,7 +13,7 @@
 #        вместо папки — общая ссылка disk.yandex.ru/d/… (или на её подпапку): её файлы, список — без обхода
 #   bash yandexdl-vps.sh pick Папка         оставить в папке только выбранные подпапки и обойти их
 #   bash yandexdl-vps.sh status             что сейчас происходит
-#   bash yandexdl-vps.sh errors [Папка]     что не скачалось и что повреждено (можно во время загрузки)
+#   bash yandexdl-vps.sh errors [Папка] [--exclude Папка]…   что не скачалось и что повреждено (и во время загрузки)
 #   bash yandexdl-vps.sh compare Ссылка Папка [--merge Куда Откуда [--partial]]   сверить общую папку со своей копией:
 #                                           что докачать из своей, потом склеить лучшее (см. README)
 #   bash yandexdl-vps.sh repair Папка|Ссылка --rclone gdrive:Папка [--exclude Папка]…   повреждённые файлы —
