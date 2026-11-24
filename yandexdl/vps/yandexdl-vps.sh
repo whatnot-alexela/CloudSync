@@ -20,6 +20,8 @@
 #                                           скачать заново и склеить с сохранёнными (хуже не станет)
 #   bash yandexdl-vps.sh verify Папка|Ссылка --rclone gdrive:Папка [--exclude Папка]… [--fix]   всё ли скачанное
 #                                           лежит в облаке; --fix — пропавшее поставить на скачивание заново
+#   bash yandexdl-vps.sh cleanup Папка --rclone gdrive:Папка [--exclude Папка]… [--delete]   что с Яндекса можно
+#                                           удалить: в облаке целое, md5 как у оригинала; --delete — в Корзину Яндекса
 #   bash yandexdl-vps.sh diagnose           в каком виде Диск отдаёт списки папок (если файлов 0)
 #   bash yandexdl-vps.sh start|stop|restart|logs
 set -euo pipefail
@@ -354,10 +356,10 @@ cmd_status() {
     echo "Задание не идёт. Чем закончился последний запуск fetch ($(last_time yandexdl-fetch)):"
   fi
   journalctl -u yandexdl-fetch -n 8 -o cat --no-pager -q || true
-  # сверка со своей копией (compare … --merge) и повтор повреждённых (repair) — если запускались
+  # сверка со своей копией (compare … --merge), повтор повреждённых (repair), чистка Яндекса — если запускались
   local u what
-  for u in yandexdl-merge yandexdl-repair; do
-    [ "$u" = yandexdl-merge ] && what="Сверка" || what="Повтор повреждённых"
+  for u in yandexdl-merge yandexdl-repair yandexdl-cleanup; do
+    case $u in yandexdl-merge) what="Сверка" ;; yandexdl-repair) what="Повтор повреждённых" ;; *) what="Чистка Яндекса" ;; esac
     if systemctl is-active -q "$u"; then
       echo
       echo "$what идёт ($u), последние строки (следить: journalctl -u $u -f -o cat):"
@@ -433,6 +435,23 @@ cmd_verify() {
   "$VENV/bin/python" -u "$APP_DIR/vps/verify.py" "$@"
 }
 
+cmd_cleanup() {
+  need_root
+  [ $# -ge 1 ] || die "нужна папка и облако: yandexdl cleanup / --rclone gdrive:Yandex [--exclude Папка]… [--delete]"
+  [ -f "$APP_DIR/vps/cleanup.py" ] || die "установлена старая версия без чистки Яндекса — сначала yandexdl update"
+  systemctl is-active -q yandexdl-cleanup && die "чистка уже идёт — смотреть: journalctl -u yandexdl-cleanup -f -o cat"
+  # список Яндекса и удаление долгие — в фоне, как сверка
+  systemctl reset-failed yandexdl-cleanup.service 2>/dev/null || true
+  systemd-run -q --unit=yandexdl-cleanup --collect --setenv=HOME=/root "$VENV/bin/python" -u "$APP_DIR/vps/cleanup.py" "$@"
+  echo "Чистка идёт в фоне (служба yandexdl-cleanup) — можно закрыть SSH. Ход: yandexdl status"
+  echo
+  journalctl -u yandexdl-cleanup -f -o cat --since "-5s" &
+  local jpid=$!
+  trap 'kill $jpid 2>/dev/null; exit 0' INT
+  while systemctl is-active -q yandexdl-cleanup; do sleep 2; done
+  sleep 1; kill $jpid 2>/dev/null || true
+}
+
 cmd_errors() {
   wait_api 3 15 || die "программа не отвечает — посмотри yandexdl status"
   "$VENV/bin/python" -u "$APP_DIR/vps/fetch.py" --errors "$@"
@@ -457,5 +476,6 @@ case "${1:-}" in
   compare)  shift; cmd_compare "$@" ;;
   repair)   shift; cmd_repair "$@" ;;
   verify)   shift; cmd_verify "$@" ;;
-  *) sed -n '2,24p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 1 ;;
+  cleanup)  shift; cmd_cleanup "$@" ;;
+  *) sed -n '2,26p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac
