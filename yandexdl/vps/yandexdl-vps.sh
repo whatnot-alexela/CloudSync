@@ -20,6 +20,8 @@
 #                                           скачать заново и склеить с сохранёнными (хуже не станет)
 #   bash yandexdl-vps.sh verify Папка|Ссылка --rclone gdrive:Папка [--exclude Папка]… [--fix]   всё ли скачанное
 #                                           лежит в облаке; --fix — пропавшее поставить на скачивание заново
+#   bash yandexdl-vps.sh missing Папка [--exclude Папка]… [--add]   что есть на Яндексе, но обход не увидел
+#                                           (полный список через rclone); --add — добавить, потом fetch --no-crawl
 #   bash yandexdl-vps.sh cleanup Папка --rclone gdrive:Папка [--exclude Папка]… [--delete]   что с Яндекса можно
 #                                           удалить: в облаке целое, md5 как у оригинала; --delete — в Корзину Яндекса
 #   bash yandexdl-vps.sh diagnose           в каком виде Диск отдаёт списки папок (если файлов 0)
@@ -358,8 +360,11 @@ cmd_status() {
   journalctl -u yandexdl-fetch -n 8 -o cat --no-pager -q || true
   # сверка со своей копией (compare … --merge), повтор повреждённых (repair), чистка Яндекса — если запускались
   local u what
-  for u in yandexdl-merge yandexdl-repair yandexdl-cleanup; do
-    case $u in yandexdl-merge) what="Сверка" ;; yandexdl-repair) what="Повтор повреждённых" ;; *) what="Чистка Яндекса" ;; esac
+  for u in yandexdl-merge yandexdl-repair yandexdl-missing yandexdl-cleanup; do
+    case $u in
+      yandexdl-merge) what="Сверка" ;; yandexdl-repair) what="Повтор повреждённых" ;;
+      yandexdl-missing) what="Сверка списка с Яндексом" ;; *) what="Чистка Яндекса" ;;
+    esac
     if systemctl is-active -q "$u"; then
       echo
       echo "$what идёт ($u), последние строки (следить: journalctl -u $u -f -o cat):"
@@ -435,21 +440,35 @@ cmd_verify() {
   "$VENV/bin/python" -u "$APP_DIR/vps/verify.py" "$@"
 }
 
+run_bg() {   # run_bg СЛУЖБА СКРИПТ.py "Что идёт" аргументы… — долгая работа в фоне, вывод — сюда же, пока не Ctrl+C
+  local unit=$1 script=$2 what=$3
+  shift 3
+  [ -f "$APP_DIR/vps/$script" ] || die "установлена старая версия без этой команды — сначала yandexdl update"
+  systemctl is-active -q "$unit" && die "уже идёт — смотреть: journalctl -u $unit -f -o cat"
+  systemctl reset-failed "$unit.service" 2>/dev/null || true
+  systemd-run -q --unit="$unit" --collect --setenv=HOME=/root "$VENV/bin/python" -u "$APP_DIR/vps/$script" "$@"
+  echo "$what идёт в фоне (служба $unit) — можно закрыть SSH. Ход: yandexdl status"
+  echo
+  journalctl -u "$unit" -f -o cat --since "-5s" &
+  local jpid=$!
+  trap 'kill $jpid 2>/dev/null; exit 0' INT
+  while systemctl is-active -q "$unit"; do sleep 2; done
+  sleep 1; kill $jpid 2>/dev/null || true
+}
+
 cmd_cleanup() {
   need_root
   [ $# -ge 1 ] || die "нужна папка и облако: yandexdl cleanup / --rclone gdrive:Yandex [--exclude Папка]… [--delete]"
-  [ -f "$APP_DIR/vps/cleanup.py" ] || die "установлена старая версия без чистки Яндекса — сначала yandexdl update"
-  systemctl is-active -q yandexdl-cleanup && die "чистка уже идёт — смотреть: journalctl -u yandexdl-cleanup -f -o cat"
-  # список Яндекса и удаление долгие — в фоне, как сверка
-  systemctl reset-failed yandexdl-cleanup.service 2>/dev/null || true
-  systemd-run -q --unit=yandexdl-cleanup --collect --setenv=HOME=/root "$VENV/bin/python" -u "$APP_DIR/vps/cleanup.py" "$@"
-  echo "Чистка идёт в фоне (служба yandexdl-cleanup) — можно закрыть SSH. Ход: yandexdl status"
-  echo
-  journalctl -u yandexdl-cleanup -f -o cat --since "-5s" &
-  local jpid=$!
-  trap 'kill $jpid 2>/dev/null; exit 0' INT
-  while systemctl is-active -q yandexdl-cleanup; do sleep 2; done
-  sleep 1; kill $jpid 2>/dev/null || true
+  run_bg yandexdl-cleanup cleanup.py "Чистка" "$@"      # список Яндекса и удаление долгие
+}
+
+cmd_missing() {
+  need_root
+  [ $# -ge 1 ] || die "нужна папка: yandexdl missing / [--exclude Папка]… [--add]"
+  if [[ " $* " == *" --add "* ]]; then
+    wait_api 3 15 || die "программа не отвечает — посмотри yandexdl status"
+  fi
+  run_bg yandexdl-missing missing.py "Сверка списка с Яндексом" "$@"
 }
 
 cmd_errors() {
@@ -477,5 +496,6 @@ case "${1:-}" in
   repair)   shift; cmd_repair "$@" ;;
   verify)   shift; cmd_verify "$@" ;;
   cleanup)  shift; cmd_cleanup "$@" ;;
-  *) sed -n '2,26p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 1 ;;
+  missing)  shift; cmd_missing "$@" ;;
+  *) sed -n '2,28p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac
