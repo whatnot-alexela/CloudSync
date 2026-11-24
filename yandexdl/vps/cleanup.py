@@ -52,6 +52,17 @@ def listing(top, filters, fast=False):
     return res
 
 
+def by_folder(items, depth=2):
+    """[(папка до depth уровней, (файлов, байт))] — больше всего места вверху."""
+    c = {}
+    for rel, s in items:
+        parts = rel.split("/")
+        k = "/".join(parts[:min(depth, len(parts) - 1)])
+        n, b = c.get(k, (0, 0))
+        c[k] = (n + 1, b + (s or 0))
+    return sorted(c.items(), key=lambda kv: -kv[1][1])
+
+
 def delete(ytop, files, log_path):
     """Удалить files (пути от ytop) в Корзину Яндекса. Возвращает (удалённые, ошибки)."""
     lst = log_path + ".список"
@@ -104,8 +115,9 @@ def main():
         db = sqlite3.connect(compare.DB, timeout=60)
         scope = "/disk" if a.target.strip().strip("/") in ("", "disk") else compare.disk_folder(db, a.target)
         excl = [compare.disk_folder(db, x) for x in a.exclude]
-        rows = [(p, f.split("/", 1)[1], note) for p, f, note in db.execute(
-            "SELECT path, fl_file, fl_note FROM files WHERE kind='file' AND fl_status='done' AND fl_file LIKE 'Диск/%' "
+        rows = [(p, f.split("/", 1)[1], note, sz) for p, f, note, sz in db.execute(
+            "SELECT path, fl_file, fl_note, COALESCE(fl_bytes, size) FROM files WHERE kind='file' AND fl_status='done' "
+            "AND fl_file LIKE 'Диск/%' "
             "AND substr(path, 1, length(?))=?", (scope + "/", scope + "/"))
             if not any(p == x or p.startswith(x + "/") for x in excl)]
         title = (scope[len("/disk/"):] if scope != "/disk" else "/ (весь Диск)") + (
@@ -132,13 +144,13 @@ def main():
 
         ok, known = [], set()
         keep = {k: [] for k in ("damaged", "differ", "nocloud", "nomd5")}
-        gone = 0
-        for path, tail, note in rows:
+        gone = []
+        for path, tail, note, dbsize in rows:
             yrel = path[len(scope) + 1:]
             crel = tail[len(base) + 1:] if base else tail
             known.add(yrel)
             if yrel not in ylist:
-                gone += 1                                    # на Яндексе уже нет (удалён раньше)
+                gone.append((yrel, dbsize))                  # по этому пути на Яндексе его нет
                 continue
             ysize, ymd5 = ylist[yrel][0]
             cs = clist.get(crel)
@@ -168,7 +180,13 @@ def main():
         for k, text in labels:
             print(f"  {len(groups[k]):7d}  {text}" + (f", {size(groups[k])}" if groups[k] else ""))
         if gone:
-            print(f"(уже нет на Яндексе: {gone} — удалены раньше)")
+            print(f"(ещё {len(gone)} файлов, {size(gone)}: по базе скачаны, но на Яндексе по этому пути их нет — "
+                  "удалены там или переложены/переименованы)")
+        for xs, text in ((other, "Не скачанные программой"), (gone, "По базе скачаны, но на Яндексе по этому пути нет")):
+            if xs:
+                print(f"\n{text} — по папкам (больше всего места вверху):")
+                for k, (n, b) in by_folder(xs)[:EXAMPLES]:
+                    print(f"  {n:7d} файлов  {human(b):>9}  {disk_path(k) if k else '(прямо в папке)'}")
         for k, text in labels[1:3]:
             if groups[k]:
                 print(f"\n{text[0].upper() + text[1:]}, например:")
@@ -183,6 +201,12 @@ def main():
             for k, text in [("ok", "МОЖНО УДАЛИТЬ — в облаке целые")] + labels:
                 xs = ok if k == "ok" else groups[k]
                 f.write(f"== {text}: {len(xs)}\n" + "".join(f"{disk_path(r)}\n" for r, _ in sorted(xs)) + "\n")
+            f.write(f"== по базе скачаны, но на Яндексе по этому пути нет: {len(gone)}\n"
+                    + "".join(f"{disk_path(r)}\n" for r, _ in sorted(gone)) + "\n")
+            for xs, text in ((other, "не скачанные программой"), (gone, "по базе скачаны, но на Яндексе нет")):
+                f.write(f"== {text} — по папкам\n" + "".join(
+                    f"{n:7d} файлов  {human(b):>9}  {disk_path(k) if k else '(прямо в папке)'}\n"
+                    for k, (n, b) in by_folder(xs)) + "\n")
         print(f"\nВсе списки: {report}")
 
         if not ok:
